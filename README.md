@@ -89,7 +89,7 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
    - `lanplay/servers.json` — 远程公网服务器列表
    - `lanplay/chinese_db.json` — 游戏标题映射
 2. **运行时读写**：`main.py` 仍按「本地文件路径」调用；适配层把路径映射到内存，**读内存 / 写内存并立刻 PUT 到 Blob**
-3. **远程下载**：GitHub 拉成功后直接写入内存 + Blob（不经 `/tmp`）
+3. **远程下载**：GitHub 拉取后计算 SHA-256；与当前内存/Blob 内容一致时跳过写入，只有内容变化才更新内存 + Blob（不经 `/tmp`）
 4. **未配置 `BLOB_READ_WRITE_TOKEN`**：退回旧的 `/tmp` 文件模式（不持久）
 
 `main.py` / `script.js` **无需修改**。
@@ -130,7 +130,7 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 打开页面右上「实时运行日志」面板：
 
 - **时区**：所有 `更新于 HH:MM:SS` 都是上海时间（UTC+8），不用看容器时区；
-- **冷启动诊断**：冷启动会打印「正在拉取 URL → 路径」「成功 size=N」或「失败原因」；
+- **冷启动诊断**：冷启动会打印「正在拉取 URL → 路径」以及「内容已更新」或「哈希一致，已跳过写入」；
 - **远程下载状态页面**：`[远程下载] 服务器列表: 正常 | 上次成功: HH:MM:SS` 表示远端拉取成功；
   停在「不可用（使用内置兜底）」时，看同屏 `[WARN]` 的 `<urlopen error ...>` 判断是 DNS 还是网络问题。
 

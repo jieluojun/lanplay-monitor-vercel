@@ -25,6 +25,7 @@ except Exception:
     pass
 
 import builtins
+import hashlib
 import io
 import json
 import shutil
@@ -1005,12 +1006,27 @@ except Exception as exc:
 _orig_download_remote_file = _app._download_remote_file
 
 
-def _download_remote_file_mem(url: str, dest_path: str) -> bool:
+def _download_remote_file_mem(url: str, dest_path: str) -> str:
+    """Vercel/BlobFS 远程下载，返回 updated / skipped / failed。
+
+    与 main.py 的哈希校验语义保持一致：远程 JSON 拉取并校验后，计算
+    SHA-256 与当前内存/Blob 内容比较。哈希一致时不调用 mem_set，避免
+    重复 PUT Blob、内存版本递增和无意义的配置重载。
+    """
     key = _path_to_key(dest_path)
     if not (_blob_enabled and key is not None):
-        return _orig_download_remote_file(url, dest_path)
+        result = _orig_download_remote_file(url, dest_path)
+        # 兼容旧版 main.py 的 bool 返回值，同时优先透传新版状态字符串。
+        if result is True:
+            return "updated"
+        if result is False or result is None:
+            return "failed"
+        return str(result)
 
-    # 复用 main 的候选 URL / SSL
+    local_data = mem_get(key)
+    local_hash = hashlib.sha256(local_data).hexdigest() if local_data is not None else None
+
+    # 复用 main 的候选 URL / SSL。
     try:
         candidates = _app._remote_candidate_urls(url)
     except Exception:
@@ -1020,41 +1036,66 @@ def _download_remote_file_mem(url: str, dest_path: str) -> bool:
         try:
             req = urllib.request.Request(
                 cand_url,
-                headers={"User-Agent": f"{_app.APP_NAME}/1.0", "Accept": "application/json"},
+                headers={
+                    "User-Agent": f"{_app.APP_NAME}/1.0",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                },
             )
             ctx_ssl = getattr(_app, "SSL_CTX", None)
             with urllib.request.urlopen(req, timeout=15, context=ctx_ssl) as resp:
                 data = resp.read()
-            # 校验 JSON
+            # 写入 BlobFS 前先校验 JSON，再计算远程内容哈希。
             json.loads(data.decode("utf-8-sig"))
+            remote_hash = hashlib.sha256(data).hexdigest()
+
+            if local_hash == remote_hash:
+                print(
+                    f"[BlobFS] 远程哈希一致，跳过写入 key={key} "
+                    f"sha256={remote_hash[:12]}",
+                    flush=True,
+                )
+                return "skipped"
+
             mem_set(key, data, push=True)
             if cand_url != url:
                 print(f"[远程下载] 经代理成功 {cand_url}", flush=True)
-            print(f"[BlobFS] 远程下载已入内存/Blob key={key} size={len(data)}B", flush=True)
-            return True
+            print(
+                f"[BlobFS] 远程内容已更新 key={key} size={len(data)}B "
+                f"{local_hash[:12] if local_hash else 'none'} -> {remote_hash[:12]}",
+                flush=True,
+            )
+            return "updated"
         except Exception as exc:
             last_err = exc
             print(f"[远程下载] 下载失败 {cand_url} -> blobfs:{key}: {exc}", flush=True)
             continue
     if last_err:
         print(f"[BlobFS] 远程下载全部失败 key={key}: {last_err!r}", flush=True)
-    return False
+    return "failed"
 
 
 _app._download_remote_file = _download_remote_file_mem  # type: ignore[assignment]
 
 
-def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> bool:
+def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> str:
     print(f"[适配器] 冷启动拉取{label} url={url} -> {dest}", flush=True)
     try:
-        ok = _app._download_remote_file(url, dest)
+        result = _app._download_remote_file(url, dest)
+        # 兼容旧版 bool 返回，防止 False 被误判为成功。
+        if result is True:
+            result = "updated"
+        elif result is False or result is None:
+            result = "failed"
+        else:
+            result = str(result)
     except Exception as exc:
         print(f"[适配器] 冷启动{label}异常: {exc!r}", flush=True)
         traceback.print_exc()
-        ok = False
+        result = "failed"
 
     key = _path_to_key(dest)
-    if ok:
+    if result != "failed":
         size = -1
         if key and mem_exists(key):
             size = len(mem_get(key) or b"")
@@ -1063,7 +1104,8 @@ def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> bool:
                 size = os.path.getsize(dest)
             except Exception:
                 pass
-        print(f"[适配器] 冷启动{label}成功 size={size}B", flush=True)
+        action = "内容已更新" if result == "updated" else "哈希一致，已跳过写入"
+        print(f"[适配器] 冷启动{label}成功：{action} size={size}B", flush=True)
         try:
             with _app._download_status_lock:
                 st = _app._download_status
@@ -1097,7 +1139,7 @@ def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> bool:
                 pass
         else:
             print(f"[适配器] 冷启动{label}失败，且无兜底", flush=True)
-    return ok
+    return result
 
 
 try:

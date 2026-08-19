@@ -1,0 +1,12 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+api/
+.github/
+*.zip
+README.md
+vercel.json
+requirements.txt
+.DS_Store

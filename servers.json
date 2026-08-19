@@ -1,0 +1,98 @@
+[
+  {
+    "id": "1",
+    "name": "jaxlewis",
+    "host": "srv.jaxlewis.top",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇨🇳 中国 河南 郑州"
+  },
+  {
+    "id": "2",
+    "name": "owlet",
+    "host": "www.grayowlet.cn",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇨🇳 中国 内蒙古 锡林郭勒"
+  },
+  {
+    "id": "3",
+    "name": "olunira",
+    "host": "olunira.fun",
+    "port": 11451,
+    "type": "rest",
+    "region": "🇨🇳 中国 北京"
+  },
+  {
+    "id": "4",
+    "name": "mulaosi",
+    "host": "ns.mulaosi.cn",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇨🇳 中国 广东 清远"
+  },
+  {
+    "id": "5",
+    "name": "r3ps4j",
+    "host": "switch.r3ps4j.nl",
+    "port": 11452,
+    "type": "rest",
+    "region": "🇨🇳 中国 丹麦 首都"
+  },
+  {
+    "id": "6",
+    "name": "lp1",
+    "host": "lp1.cpalm.org",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇨🇳 中国 台湾 高雄"
+  },
+  {
+    "id": "7",
+    "name": "tekn0",
+    "host": "tekn0.net",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇺🇸 美国 加利福尼亚"
+  },
+  {
+    "id": "8",
+    "name": "muitxobem",
+    "host": "muitxobem-lanplay.ddns.net",
+    "port": 11451,
+    "type": "rest",
+    "region": "🇺🇸 美国"
+  },
+  {
+    "id": "9",
+    "name": "jaysea1",
+    "host": "switch.jayseateam.nl",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇳🇱  荷兰 北荷兰"
+  },
+  {
+    "id": "10",
+    "name": "jaysea2",
+    "host": "switch.jayseateam.nl",
+    "port": 11453,
+    "type": "rest",
+    "region": "🇳🇱 荷兰 北荷兰"
+  },
+  {
+    "id": "11",
+    "name": "lbxmb",
+    "host": "lan.lbxmb.fr",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇫🇷 法国 法兰西岛 巴黎"
+  },
+  {
+    "id": "12",
+    "name": "erdbeerbaerlp",
+    "host": "erdbeerbaerlp.de",
+    "port": 11451,
+    "type": "graphql",
+    "region": "🇩🇪 德国 萨克森"
+  }
+]

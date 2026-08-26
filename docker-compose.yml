@@ -1,0 +1,22 @@
+services:
+  lanplay:
+    build: .
+    container_name: lanplay-monitor
+    ports:
+      - "11451:11451"
+    environment:
+      - PORT=11451
+      # 可选：聊天 / 对象存储（Cloudflare R2 或腾讯云 COS）
+      # - GOEASY_APPKEY=
+      # - GOEASY_HOST=
+      # - R2_ACCOUNT_ID=
+      # - R2_ACCESS_KEY_ID=
+      # - R2_SECRET_ACCESS_KEY=
+      # - R2_BUCKET_NAME=
+      # - STORAGE_PROVIDER=r2
+      # - SECURITY_PASSWORD=your-secure-password
+    restart: unless-stopped
+    # 需要持久化「自定义服务器 / 环境配置」时，取消下面注释
+    # （把容器内 /app 映射到宿主机目录；首次启动会用镜像内文件填充）
+    # volumes:
+    #   - ./appdata:/app

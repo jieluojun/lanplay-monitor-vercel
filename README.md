@@ -1,12 +1,12 @@
 # LAN-Play 房间监控 · 一键部署包
 
-基于原版 `main.py` / `script.js`，增加安全密码明文化与环境变量支持；`api/index.py` 为 Vercel 适配层（含 Blob 持久化）+ 部署相关配置。
+基于原版 `main.py` / `script.js`，增加安全密码明文化与环境变量支持；`api/index.py` 为 Vercel 适配层（含 Blob / Cloudflare R2 持久化）+ 部署相关配置。
 
 仓库地址：`https://github.com/jieluojun/lanplay-monitor-vercel`
 
 | 部署方式 | 适合场景 | 服务器列表 | 添加自定义服务器 / 环境变量配置 |
 |---|---|---|---|
-| **Vercel** | 公网页面 | ✅ 预打包 + 定时刷新；Blob 缓存远程列表/标题映射 | ✅ 配 `BLOB_READ_WRITE_TOKEN` 后持久化到 Vercel Blob |
+| **Vercel** | 公网页面 | ✅ 预打包 + 定时刷新；Blob / R2 缓存远程列表/标题映射 | ✅ 配 `BLOB_READ_WRITE_TOKEN`（Blob）或 `R2_PERSIST_*`（Cloudflare R2）后持久化 |
 | **Docker** | 完整功能 | ✅ 原版后台线程实时下载 | ✅ 本地文件 / 挂卷永久保存 |
 
 ---
@@ -19,7 +19,7 @@
 | `servers.json` | 远端服务器列表（部署时预取，13 台） |
 | `chinese_db.json` | 游戏标题映射（部署时预取，1 万+ 条） |
 | `env.json.example` | 环境配置模板（复制成 `env.json` 放进仓库根目录） |
-| `api/index.py` | Vercel 适配层（路由前缀还原 + 时区/日志 + /tmp 重定向 + **Vercel Blob 持久化**） |
+| `api/index.py` | Vercel 适配层（路由前缀还原 + 时区/日志 + /tmp 重定向 + **Vercel Blob / Cloudflare R2 持久化**） |
 | `vercel.json` | Vercel 路由 / 函数配置 |
 | `.github/workflows/*` | deploy / refresh-servers / docker |
 | `Dockerfile` / `docker-compose.yml` | 完整功能镜像 / 一键启动 |
@@ -74,7 +74,7 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 | 问题 | 原因 | 解决方案 |
 |---|---|---|
 | 远端服务器列表拉取 | Vercel 不能跑后台线程 | ① 仓库预打包 13 台兜底；② `api/index.py` 冷启动直连拉取最新；③ GitHub Action 每 6h 同步并触发重新部署 |
-| 添加 / 编辑自定义服务器、保存环境变量、远程列表/标题映射缓存 | Vercel 文件系统只读，默认只写 `/tmp`（冷启动清空） | **推荐**：项目接 Vercel Blob，配置 `BLOB_READ_WRITE_TOKEN`，适配层内存直连 Blob 同步 `env.json` / `servers_manual.json` / `servers.json` / `chinese_db.json`（不写 /tmp）；或改用 Docker 挂卷 |
+| 添加 / 编辑自定义服务器、保存环境变量、远程列表/标题映射缓存 | Vercel 文件系统只读，默认只写 `/tmp`（冷启动清空） | **推荐**：接 Vercel Blob（配 `BLOB_READ_WRITE_TOKEN`）或 Cloudflare R2（配 `R2_PERSIST_*`），适配层内存直连远端存储同步 `env.json` / `servers_manual.json` / `servers.json` / `chinese_db.json`（不写 /tmp）；或改用 Docker 挂卷 |
 
 > UDP 局域网扫描在 Vercel 上不可用（平台禁用原始 UDP），只能扫公网服务器；
 > 日志长轮询受 60s 函数时长限制。
@@ -121,9 +121,53 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 - **密钥安全**：优先 Private store；即使 Public，也不要把 blob URL 发到前端。完整配置仍受安全密码门禁保护。
 - **access 必须匹配 store**：Private store 只能 `BLOB_ACCESS=private`（默认）。若日志出现 `Cannot use public access on a private store`，说明旧版用了错误请求头；本版已改为官方 `x-vercel-blob-access`。
 - **并发**：多实例同时保存时 last-write-wins；个人/小流量场景通常可接受。
-- **与 R2/COS 无关**：Blob 存应用配置 + 远程下载缓存（上述 4 个 JSON）；聊天媒体/头像仍走你配置的 R2 或腾讯云 COS。
+- **与聊天媒体存储无关**：这里存的是应用配置 + 远程下载缓存（上述 4 个 JSON）；聊天媒体/头像仍走你在 env.json 里配置的 R2 或腾讯云 COS。数据持久化也可不用 Blob、直接用 R2（见下节）。
 - **体积**：`chinese_db.json` 约 0.5MB 级，Blob 免费额度通常足够；若不想缓存标题映射，可自行在 Blob 控制台删掉 `lanplay/chinese_db.json`（不影响其它文件）。
 - **Docker 部署不受影响**：`BLOB_*` 仅 Vercel 适配层读取；Docker 继续写本地文件/挂卷。
+
+## Cloudflare R2 持久化（可选，与 Blob 二选一）
+
+不想用 Vercel Blob（或已有 Cloudflare 账号）时，可用 **Cloudflare R2** 做同样的数据持久化。
+适配层走 R2 的 **S3 兼容 API + AWS Signature V4**（零第三方依赖），对象布局与 Blob 完全一致：
+
+- `lanplay/env.json` / `lanplay/servers_manual.json` / `lanplay/servers.json` / `lanplay/chinese_db.json`
+- 冷启动 hydrate：R2 → 内存（缺失则用部署包兜底并**回填** R2）；运行时读写与 Blob 模式相同
+- 多实例一致性：读关键接口前按 TTL 从 R2 重新拉取（`PERSIST_REVALIDATE_TTL`，默认 3 秒）
+
+### 接入步骤
+
+1. Cloudflare 控制台 → **R2 Object Storage** → 创建桶（**不要**开启公开访问；`env.json` 含密钥）
+2. **Manage R2 API Tokens** → Create API Token → 权限选 **Object Read & Write**（可限定到该桶）→ 得到 Access Key ID / Secret Access Key
+3. 在 Vercel 项目 → Settings → Environment Variables 添加（账号 ID 在 R2 概览页右侧）：
+   - `R2_PERSIST_ACCOUNT_ID`（回退读 `R2_ACCOUNT_ID`）
+   - `R2_PERSIST_ACCESS_KEY_ID`（回退读 `R2_ACCESS_KEY_ID`）
+   - `R2_PERSIST_SECRET_ACCESS_KEY`（回退读 `R2_SECRET_ACCESS_KEY`）
+   - `R2_PERSIST_BUCKET`（回退读 `R2_BUCKET_NAME`）
+4. 重新部署。实时运行日志应看到 `[R2FS] 内存直连模式 provider=r2 …`；保存配置 / 添加服务器后出现 `[R2FS] PUT 成功 …`
+
+> 已同时配置 Blob 和 R2 时默认用 Blob（兼容旧部署）；要强制 R2 请设置 `PERSIST_PROVIDER=r2`。
+
+### 相关环境变量
+
+| OS 变量 | 默认 | 说明 |
+|---|---|---|
+| `PERSIST_PROVIDER` | `auto` | 持久化后端：`auto`（Blob 优先，其次 R2）/ `blob` / `r2` |
+| `R2_PERSIST_ACCOUNT_ID` | 回退 `R2_ACCOUNT_ID` | Cloudflare Account ID |
+| `R2_PERSIST_ACCESS_KEY_ID` | 回退 `R2_ACCESS_KEY_ID` | R2 API Token 的 Access Key ID |
+| `R2_PERSIST_SECRET_ACCESS_KEY` | 回退 `R2_SECRET_ACCESS_KEY` | R2 API Token 的 Secret |
+| `R2_PERSIST_BUCKET` | 回退 `R2_BUCKET_NAME` | 桶名 |
+| `R2_PERSIST_PREFIX` | `lanplay/` | 对象键前缀（与 Blob 布局一致，可共用同名前缀策略） |
+| `R2_PERSIST_ENDPOINT` | `https://{bucket}.{account}.r2.cloudflarestorage.com` | 端点模板，支持 `{bucket}`/`{account}` 占位符；EU 管辖区桶或自建 S3 兼容服务（path-style，如 `http://host:9000/{bucket}`）时使用 |
+| `R2_PERSIST_REGION` | `auto` | SigV4 签名 region；R2 固定 `auto`，一般不用改 |
+| `PERSIST_REVALIDATE_TTL` | `3` | 多实例读路径重新拉取远端的 TTL（秒） |
+
+### 注意
+
+- **与聊天媒体存储相互独立**：聊天头像 / 群文件的 R2（或腾讯云 COS）凭据存在 `env.json` 里由 `main.py` 读取；数据持久化凭据**只**来自 OS 环境变量（`env.json` 本身就存在 R2 里，冷启动必须先有凭据才能读到它）。两者可共用同一套 `R2_*` 变量，也可用 `R2_PERSIST_*` 单独指定。
+- **桶保持私有**：持久化对象含 `env.json`（密码 / GoEasy / R2 密钥），不要开公开访问、不要把对象 URL 发到前端。
+- **费用**：R2 免费额度（每秒 OPS / 每月 A/B 类请求与存储量）对个人监控站点通常足够；`chinese_db.json` 约 0.5MB，回填与日常写入量都很小。
+- **并发**：与 Blob 模式相同，多实例同时保存时 last-write-wins。
+- **Docker 部署不受影响**：`R2_PERSIST_*` 仅 Vercel 适配层读取。
 
 ## 运行日志（适配器层新增）
 
@@ -198,6 +242,13 @@ Settings → Environment Variables** 里直接配同名变量即可生效，**�
 | — | `BLOB_PREFIX` | str | `"lanplay/"` | Blob 对象路径前缀 |
 | — | `BLOB_API_VERSION` | str | `"12"` | 对齐官方 SDK |
 | — | `BLOB_API_URL` | str | `https://vercel.com/api/blob` | 控制面 API 基址 |
+| — | `PERSIST_PROVIDER` | enum | `"auto"` | **Vercel 专用**：持久化后端 `auto` / `blob` / `r2`（auto=Blob 优先） |
+| — | `R2_PERSIST_ACCOUNT_ID` | str | 回退 `R2_ACCOUNT_ID` | R2 持久化：Cloudflare Account ID |
+| — | `R2_PERSIST_ACCESS_KEY_ID` | str | 回退 `R2_ACCESS_KEY_ID` | R2 持久化：Access Key ID |
+| — | `R2_PERSIST_SECRET_ACCESS_KEY` | str | 回退 `R2_SECRET_ACCESS_KEY` | R2 持久化：Secret Access Key |
+| — | `R2_PERSIST_BUCKET` | str | 回退 `R2_BUCKET_NAME` | R2 持久化：桶名 |
+| — | `R2_PERSIST_PREFIX` | str | `"lanplay/"` | R2 持久化：对象键前缀 |
+| — | `R2_PERSIST_ENDPOINT` | str | R2 默认端点 | 端点模板（`{bucket}`/`{account}` 占位；EU 桶 / path-style 自建服务） |
 
 **密码设置**（三选一，OS 环境变量优先）：
 

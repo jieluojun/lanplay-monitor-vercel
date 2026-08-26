@@ -5,12 +5,16 @@ Vercel Serverless 入口（薄适配层，不修改 main.py / script.js）。
 
 职责：
 1. import 原始 main.py，复用 MonitorHandler。
-2. 若配置 BLOB_READ_WRITE_TOKEN：
+2. 数据持久化后端（二选一，凭据均来自 OS 环境变量）：
+   - Vercel Blob：配置 BLOB_READ_WRITE_TOKEN；
+   - Cloudflare R2：配置 R2_PERSIST_*（缺省回退 R2_*）环境变量；
+   由 PERSIST_PROVIDER 选择（auto=默认，Blob 优先，兼容旧部署）。
+3. 启用持久化后：
    - 用「内存虚拟文件系统」接管 env/servers/chinese_db 的读写；
-   - 读：内存（冷启动从 Blob / 部署包填充）；
-   - 写：更新内存并直接 PUT 到 Blob（不写 /tmp、不落盘）；
-3. 未配置 Blob 时退回 /tmp 文件（与旧行为兼容）。
-4. 时区 Asia/Shanghai；冷启动拉 GitHub 远程列表并回写 Blob。
+   - 读：内存（冷启动从远端存储 / 部署包填充）；
+   - 写：更新内存并直接 PUT 到远端存储（不写 /tmp、不落盘）；
+4. 未启用任何持久化时退回 /tmp 文件（与旧行为兼容）。
+5. 时区 Asia/Shanghai；冷启动拉 GitHub 远程列表并回写存储。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ except Exception:
 
 import builtins
 import hashlib
+import hmac
 import io
 import json
 import shutil
@@ -90,8 +95,17 @@ except Exception:
 _app.REMOTE_UPDATE_PROXY = ""
 
 # ===========================================================================
-# Blob REST（对齐 @vercel/blob）
+# 持久化后端选择：Vercel Blob（对齐 @vercel/blob）或 Cloudflare R2（S3 API）
 # ===========================================================================
+def _env_first(*names: str, default: str = "") -> str:
+    """返回第一个非空环境变量（去空白）。"""
+    for _n in names:
+        _v = (os.environ.get(_n) or "").strip()
+        if _v:
+            return _v
+    return default
+
+
 _BLOB_API = (os.environ.get("BLOB_API_URL") or "https://vercel.com/api/blob").strip().rstrip("/")
 _BLOB_TOKEN = (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").strip()
 _BLOB_ACCESS = (os.environ.get("BLOB_ACCESS") or "private").strip().lower()
@@ -101,8 +115,62 @@ _BLOB_PREFIX = (os.environ.get("BLOB_PREFIX") or "lanplay/").strip()
 if _BLOB_PREFIX and not _BLOB_PREFIX.endswith("/"):
     _BLOB_PREFIX += "/"
 _BLOB_API_VERSION = (os.environ.get("BLOB_API_VERSION") or "12").strip() or "12"
-_blob_enabled = bool(_BLOB_TOKEN)
 _blob_effective_access = _BLOB_ACCESS
+
+# ---- Cloudflare R2 数据持久化（与 Blob 二选一）----
+# 凭据只从 OS 环境变量读取（R2_PERSIST_*，缺省回退聊天媒体用的 R2_*）：
+# env.json 本身就存在 R2 里，冷启动必须先有凭据才能读到它（避免鸡生蛋），
+# 且用户在网页把「聊天媒体」切到 COS 时，数据持久化不受影响。
+_R2P_ACCOUNT_ID = _env_first("R2_PERSIST_ACCOUNT_ID", "R2_ACCOUNT_ID")
+_R2P_ACCESS_KEY_ID = _env_first("R2_PERSIST_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID")
+_R2P_SECRET_ACCESS_KEY = _env_first("R2_PERSIST_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY")
+_R2P_BUCKET = _env_first("R2_PERSIST_BUCKET", "R2_BUCKET_NAME")
+# 端点模板（可选）：支持 {bucket}/{account} 占位符；缺省虚拟主机风格
+# https://{bucket}.{account}.r2.cloudflarestorage.com；EU 管辖区桶可填
+# https://{bucket}.{account}.eu.r2.cloudflarestorage.com；自建 S3 兼容服务
+# 可填 path-style，如 http://127.0.0.1:9000/{bucket}。
+_R2P_ENDPOINT_TPL = _env_first("R2_PERSIST_ENDPOINT")
+_R2P_REGION = _env_first("R2_PERSIST_REGION") or "auto"
+_R2P_PREFIX = (_env_first("R2_PERSIST_PREFIX") or "lanplay/").strip()
+if _R2P_PREFIX and not _R2P_PREFIX.endswith("/"):
+    _R2P_PREFIX += "/"
+
+
+def _r2_persist_configured() -> bool:
+    return bool(_R2P_ACCOUNT_ID and _R2P_ACCESS_KEY_ID and _R2P_SECRET_ACCESS_KEY and _R2P_BUCKET)
+
+
+# ---- 提供方选择：PERSIST_PROVIDER = auto（默认）/ blob / r2 ----
+_PERSIST_PROVIDER = _env_first("PERSIST_PROVIDER", "PERSIST_BACKEND", default="auto").lower()
+if _PERSIST_PROVIDER not in ("auto", "blob", "r2"):
+    print(f"[适配器] PERSIST_PROVIDER={_PERSIST_PROVIDER!r} 无效，按 auto 处理", flush=True)
+    _PERSIST_PROVIDER = "auto"
+
+
+def _resolve_persist_provider() -> str:
+    """返回实际生效的持久化提供方：'blob' / 'r2' / ''（无，退回 /tmp）。"""
+    if _PERSIST_PROVIDER == "blob":
+        return "blob" if _BLOB_TOKEN else ""
+    if _PERSIST_PROVIDER == "r2":
+        return "r2" if _r2_persist_configured() else ""
+    # auto：兼容旧部署——先 Blob，再 R2，都没有则 /tmp
+    if _BLOB_TOKEN:
+        return "blob"
+    if _r2_persist_configured():
+        return "r2"
+    return ""
+
+
+_PERSIST_ACTIVE = _resolve_persist_provider()
+if _PERSIST_PROVIDER in ("blob", "r2") and not _PERSIST_ACTIVE:
+    print(
+        f"[适配器] PERSIST_PROVIDER={_PERSIST_PROVIDER!r} 但凭据不全，退回 /tmp 文件模式",
+        flush=True,
+    )
+# 远程持久化已启用（Blob 或 R2）；历史变量名保留，语义泛化
+_persist_enabled = bool(_PERSIST_ACTIVE)
+# 日志前缀按后端区分
+_FS_TAG = {"blob": "[BlobFS]", "r2": "[R2FS]"}.get(_PERSIST_ACTIVE, "[VFS]")
 
 
 def _parse_store_id_from_token(token: str) -> str:
@@ -117,16 +185,17 @@ _BLOB_STORE_ID = (
     or _parse_store_id_from_token(_BLOB_TOKEN)
 )
 
-# 逻辑名 → blob pathname
-_BLOB_PATHNAMES: dict[str, str] = {
-    "env": f"{_BLOB_PREFIX}env.json",
-    "servers_manual": f"{_BLOB_PREFIX}servers_manual.json",
-    "servers": f"{_BLOB_PREFIX}servers.json",
-    "chinese_db": f"{_BLOB_PREFIX}chinese_db.json",
+# 逻辑名 → 远端对象路径（Blob pathname / R2 object key）
+_ACTIVE_PREFIX = _R2P_PREFIX if _PERSIST_ACTIVE == "r2" else _BLOB_PREFIX
+_REMOTE_PATHNAMES: dict[str, str] = {
+    "env": f"{_ACTIVE_PREFIX}env.json",
+    "servers_manual": f"{_ACTIVE_PREFIX}servers_manual.json",
+    "servers": f"{_ACTIVE_PREFIX}servers.json",
+    "chinese_db": f"{_ACTIVE_PREFIX}chinese_db.json",
 }
 
 # 虚拟路径根（不存在于真实磁盘；仅作 main.py 的路径字符串）
-_VFS_ROOT = "/__blobfs__"
+_VFS_ROOT = "/__remotefs__"
 _VFS_PATHS: dict[str, str] = {
     "env": f"{_VFS_ROOT}/env.json",
     "servers_manual": f"{_VFS_ROOT}/servers_manual.json",
@@ -145,7 +214,7 @@ _TMP_PATHS: dict[str, str] = {
 
 
 def _active_paths() -> dict[str, str]:
-    return _VFS_PATHS if _blob_enabled else _TMP_PATHS
+    return _VFS_PATHS if _persist_enabled else _TMP_PATHS
 
 
 def _apply_paths_to_app() -> None:
@@ -243,9 +312,9 @@ def _is_managed_tmp_sidecar(path: str | os.PathLike[str] | Path | None) -> bool:
 # ===========================================================================
 _mem_lock = threading.RLock()
 # key → bytes | None（None = 明确不存在）
-_mem: dict[str, bytes | None] = {k: None for k in _BLOB_PATHNAMES}
+_mem: dict[str, bytes | None] = {k: None for k in _REMOTE_PATHNAMES}
 # key → 单调递增版本（充当 mtime_ns）
-_mem_ver: dict[str, int] = {k: 0 for k in _BLOB_PATHNAMES}
+_mem_ver: dict[str, int] = {k: 0 for k in _REMOTE_PATHNAMES}
 # download 临时缓冲：tmp_path → (target_key, bytes)
 _mem_tmp: dict[str, tuple[str, bytes]] = {}
 _ver_seq = 1
@@ -269,25 +338,25 @@ def mem_set(key: str, data: bytes, *, push: bool = True) -> None:
     with _mem_lock:
         _mem[key] = raw
         ver = _bump(key)
-    print(f"[BlobFS] 内存已更新 key={key} size={len(raw)}B ver={ver} push={push}", flush=True)
-    if push and _blob_enabled:
+    print(f"{_FS_TAG} 内存已更新 key={key} size={len(raw)}B ver={ver} push={push}", flush=True)
+    if push and _persist_enabled:
         try:
-            ok = _blob_put(_BLOB_PATHNAMES[key], raw)
+            ok = _remote_put(_REMOTE_PATHNAMES[key], raw)
             if ok:
-                print(f"[BlobFS] 已同步 Blob key={key} size={len(raw)}B pathname={_BLOB_PATHNAMES[key]}", flush=True)
+                print(f"{_FS_TAG} 已同步远端 key={key} size={len(raw)}B path={_REMOTE_PATHNAMES[key]}", flush=True)
             else:
-                print(f"[BlobFS] 同步 Blob 失败 key={key}（内存已是新值；下次冷启动可能回潮）", flush=True)
+                print(f"{_FS_TAG} 同步远端失败 key={key}（内存已是新值；下次冷启动可能回潮）", flush=True)
         except Exception as exc:
-            print(f"[BlobFS] 同步 Blob 异常 key={key}: {exc!r}", flush=True)
+            print(f"{_FS_TAG} 同步远端异常 key={key}: {exc!r}", flush=True)
 
 
 def mem_force_push(key: str) -> bool:
-    """把当前内存中的 key 强制 PUT 到 Blob（删除服务器后兜底同步）。"""
-    if not _blob_enabled or key not in _BLOB_PATHNAMES:
+    """把当前内存中的 key 强制 PUT 到远端存储（删除服务器后兜底同步）。"""
+    if not _persist_enabled or key not in _REMOTE_PATHNAMES:
         return False
     data = mem_get(key)
     if data is None:
-        # 不存在则推送空数组/空对象，避免 Blob 残留旧自定义服务器
+        # 不存在则推送空数组/空对象，避免远端残留旧自定义服务器
         if key in ("servers_manual", "servers"):
             data = b"[]\n"
         elif key == "env":
@@ -298,27 +367,29 @@ def mem_force_push(key: str) -> bool:
             _mem[key] = data
             _bump(key)
     try:
-        ok = _blob_put(_BLOB_PATHNAMES[key], data)
+        ok = _remote_put(_REMOTE_PATHNAMES[key], data)
         print(
-            f"[BlobFS] force_push key={key} ok={ok} size={len(data)}B pathname={_BLOB_PATHNAMES[key]}",
+            f"{_FS_TAG} force_push key={key} ok={ok} size={len(data)}B path={_REMOTE_PATHNAMES[key]}",
             flush=True,
         )
         return bool(ok)
     except Exception as exc:
-        print(f"[BlobFS] force_push 异常 key={key}: {exc!r}", flush=True)
+        print(f"{_FS_TAG} force_push 异常 key={key}: {exc!r}", flush=True)
         return False
 
 
-# 多实例一致性：其它实例写了 Blob 后，本实例内存可能仍是旧值。
-# 按 TTL 从 Blob 重新拉取关键 key（尤其 servers_manual / env）。
+# 多实例一致性：其它实例写了远端存储后，本实例内存可能仍是旧值。
+# 按 TTL 从远端重新拉取关键 key（尤其 servers_manual / env）。
 _revalidate_lock = threading.RLock()
 _revalidate_at: dict[str, float] = {}
-_REVALIDATE_TTL = float(os.environ.get("BLOB_REVALIDATE_TTL", "3") or 3)
+_REVALIDATE_TTL = float(
+    _env_first("PERSIST_REVALIDATE_TTL", "BLOB_REVALIDATE_TTL", default="3") or 3
+)
 
 
-def blob_revalidate_key(key: str, *, force: bool = False) -> bool:
-    """若 Blob 上内容更新，覆盖本实例内存。返回是否发生了变更。"""
-    if not _blob_enabled or key not in _BLOB_PATHNAMES:
+def persist_revalidate_key(key: str, *, force: bool = False) -> bool:
+    """若远端存储上内容更新，覆盖本实例内存。返回是否发生了变更。"""
+    if not _persist_enabled or key not in _REMOTE_PATHNAMES:
         return False
     now = time.time()
     with _revalidate_lock:
@@ -327,25 +398,25 @@ def blob_revalidate_key(key: str, *, force: bool = False) -> bool:
             return False
         _revalidate_at[key] = now
     try:
-        remote = _blob_get(_BLOB_PATHNAMES[key])
+        remote = _remote_get(_REMOTE_PATHNAMES[key])
     except Exception as exc:
-        print(f"[BlobFS] revalidate GET 失败 key={key}: {exc!r}", flush=True)
+        print(f"{_FS_TAG} revalidate GET 失败 key={key}: {exc!r}", flush=True)
         return False
     if remote is None:
-        # Blob 无对象：若本地是用户配置，保留本地；servers_manual 空对象视为 []
+        # 远端无对象：若本地是用户配置，保留本地；servers_manual 空对象视为 []
         return False
     if not _validate_payload(key, remote):
-        print(f"[BlobFS] revalidate 校验失败 key={key}", flush=True)
+        print(f"{_FS_TAG} revalidate 校验失败 key={key}", flush=True)
         return False
     local = mem_get(key)
     if local is not None and local == remote:
         return False
-    # 不 push 回 Blob，只更新内存
+    # 不 push 回远端，只更新内存
     with _mem_lock:
         _mem[key] = bytes(remote)
         ver = _bump(key)
     print(
-        f"[BlobFS] revalidate 已用 Blob 覆盖内存 key={key} size={len(remote)}B ver={ver}",
+        f"{_FS_TAG} revalidate 已用远端覆盖内存 key={key} size={len(remote)}B ver={ver}",
         flush=True,
     )
     # 配置签名变化后强制 refresh
@@ -355,16 +426,16 @@ def blob_revalidate_key(key: str, *, force: bool = False) -> bool:
         if key == "env":
             _app.apply_r2_config_to_runtime(_app.load_env_config())
     except Exception as exc:
-        print(f"[BlobFS] revalidate 后 refresh 失败: {exc!r}", flush=True)
+        print(f"{_FS_TAG} revalidate 后 refresh 失败: {exc!r}", flush=True)
     return True
 
 
-def blob_revalidate_user_config(*, force: bool = False) -> None:
+def persist_revalidate_user_config(*, force: bool = False) -> None:
     """读路径前刷新用户相关配置（自定义服务器 + env）。"""
-    if not _blob_enabled:
+    if not _persist_enabled:
         return
-    blob_revalidate_key("servers_manual", force=force)
-    blob_revalidate_key("env", force=force)
+    persist_revalidate_key("servers_manual", force=force)
+    persist_revalidate_key("env", force=force)
 
 
 
@@ -441,7 +512,7 @@ def _blob_cdn_url(pathname: str, access: str | None = None) -> str:
 
 def _blob_put(pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
     global _blob_effective_access
-    if not _blob_enabled:
+    if not _persist_enabled:
         return False
     qs = urllib.parse.urlencode({"pathname": pathname})
     url = f"{_BLOB_API}/?{qs}"
@@ -482,7 +553,7 @@ def _blob_put(pathname: str, content: bytes, content_type: str = "application/js
 
 
 def _blob_get(pathname: str) -> bytes | None:
-    if not _blob_enabled:
+    if not _persist_enabled:
         return None
     if _BLOB_STORE_ID:
         for acc in (_blob_effective_access, "private", "public"):
@@ -520,11 +591,196 @@ def _blob_get(pathname: str) -> bytes | None:
     return None
 
 
+# ===========================================================================
+# Cloudflare R2 后端（S3 兼容 API + AWS Signature V4，零第三方依赖）
+# ===========================================================================
+class _CloudflareR2Backend:
+    """数据持久化 R2 后端。
+
+    签名实现独立于 main.py 的聊天媒体存储（后者读运行时全局变量，
+    可能被 env.json 切到 COS）；持久化凭据固定来自 OS 环境变量。
+    """
+
+    label = "R2"
+
+    def __init__(
+        self,
+        account_id: str,
+        access_key_id: str,
+        secret_access_key: str,
+        bucket: str,
+        endpoint_tpl: str = "",
+        region: str = "auto",
+    ) -> None:
+        self._access_key = access_key_id
+        self._secret = secret_access_key
+        self._region = region or "auto"
+        tpl = (endpoint_tpl or "").strip() or "https://{bucket}.{account}.r2.cloudflarestorage.com"
+        if "://" not in tpl:
+            tpl = "https://" + tpl
+        # 端点模板支持 {bucket}/{account} 占位符；base 形如
+        # https://<bucket>.<account>.r2.cloudflarestorage.com（虚拟主机风格）
+        # 或 http://host:9000/<bucket>（path-style，自建 S3 兼容服务）
+        self._base = tpl.format(bucket=bucket, account=account_id).rstrip("/")
+        self._host = urllib.parse.urlparse(self._base).netloc
+        # path-style 端点的 base 含 /<bucket> 前缀，必须一并纳入签名 CanonicalURI
+        self._uri_prefix = urllib.parse.urlparse(self._base).path.rstrip("/")
+
+    # ---- AWS Signature V4（service=s3）----
+    def _authorize(
+        self, method: str, uri: str, headers: dict[str, str], payload: bytes
+    ) -> tuple[str, str]:
+        now = _dt_cls.now(_dt_tz.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        hm = {k.lower(): str(v).strip() for k, v in headers.items()}
+        hm["x-amz-date"] = amz_date
+        names = sorted(hm)
+        signed_headers = ";".join(names)
+        canonical_headers = "".join(f"{k}:{hm[k]}\n" for k in names)
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        canonical_request = "\n".join((method, uri, "", canonical_headers, signed_headers, payload_hash))
+        scope = f"{date_stamp}/{self._region}/s3/aws4_request"
+        string_to_sign = "\n".join(
+            (
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            )
+        )
+
+        def _h(key: bytes, msg: str) -> bytes:
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+        k = _h(("AWS4" + self._secret).encode("utf-8"), date_stamp)
+        k = _h(k, self._region)
+        k = _h(k, "s3")
+        k = _h(k, "aws4_request")
+        signature = hmac.new(k, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        auth = (
+            f"AWS4-HMAC-SHA256 Credential={self._access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        )
+        return auth, amz_date
+
+    def _request(
+        self,
+        method: str,
+        key: str,
+        *,
+        payload: bytes = b"",
+        content_type: str = "application/json; charset=utf-8",
+        timeout: float = 30.0,
+    ) -> tuple[int, bytes, str]:
+        """返回 (status, body, etag)；网络异常时 status=0。"""
+        # 签名用 CanonicalURI（path-style 端点须含 base 自带的 /<bucket> 前缀）；
+        # 请求 URL 则直接拼 base（base 已含该前缀，勿重复）。
+        quoted = urllib.parse.quote(key.lstrip("/"), safe="/")
+        uri = f"{self._uri_prefix}/{quoted}"
+        url = f"{self._base}/{quoted}"
+        headers: dict[str, str] = {
+            "Host": self._host,
+            "x-amz-content-sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        if method == "PUT":
+            headers["Content-Type"] = content_type
+            headers["Content-Length"] = str(len(payload))
+        auth, amz_date = self._authorize(method, uri, headers, payload)
+        headers["Authorization"] = auth
+        headers["x-amz-date"] = amz_date
+        req = urllib.request.Request(
+            url,
+            data=payload if method == "PUT" else None,
+            method=method,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read()
+                return int(resp.status), body, str(resp.headers.get("ETag", "") or "")
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read() or b""
+            except Exception:
+                body = b""
+            return int(e.code), body, ""
+        except Exception as exc:
+            print(f"{_FS_TAG} {method} 请求异常 key={key}: {exc!r}", flush=True)
+            return 0, str(exc).encode("utf-8", errors="replace"), ""
+
+    # ---- 后端统一接口 ----
+    def get(self, pathname: str) -> bytes | None:
+        key = pathname.lstrip("/")
+        status, body, _etag = self._request("GET", key, timeout=30.0)
+        if status == 200:
+            return body
+        if status == 404:
+            return None
+        if status in (401, 403):
+            print(
+                f"{_FS_TAG} GET 鉴权失败（检查 R2_PERSIST_ACCESS_KEY_ID / "
+                f"R2_PERSIST_SECRET_ACCESS_KEY 及 Token 的对象读写权限）key={key}",
+                flush=True,
+            )
+            return None
+        print(f"{_FS_TAG} GET 失败 key={key} status={status} body={body[:200]!r}", flush=True)
+        return None
+
+    def put(self, pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
+        key = pathname.lstrip("/")
+        status, body, etag = self._request("PUT", key, payload=content, content_type=content_type, timeout=45.0)
+        if 200 <= status < 300:
+            tag = etag.strip().strip('"')[:16]
+            print(f"{_FS_TAG} PUT 成功 key={key} size={len(content)}B etag={tag}", flush=True)
+            return True
+        if status in (401, 403):
+            print(f"{_FS_TAG} PUT 鉴权失败（检查 R2 Token 的 Object Read & Write 权限）key={key}", flush=True)
+            return False
+        print(f"{_FS_TAG} PUT 失败 key={key} status={status} body={body[:200]!r}", flush=True)
+        return False
+
+
+class _VercelBlobBackend:
+    """Blob 薄包装：沿用上方 Blob REST 实现，接口与 R2 后端一致。"""
+
+    label = "Blob"
+
+    def get(self, pathname: str) -> bytes | None:
+        return _blob_get(pathname)
+
+    def put(self, pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
+        return _blob_put(pathname, content, content_type)
+
+
+# 实例化生效后端 + 统一读写入口（VFS 层只认这两个函数）
+_BACKEND = None
+if _PERSIST_ACTIVE == "r2":
+    _BACKEND = _CloudflareR2Backend(
+        account_id=_R2P_ACCOUNT_ID,
+        access_key_id=_R2P_ACCESS_KEY_ID,
+        secret_access_key=_R2P_SECRET_ACCESS_KEY,
+        bucket=_R2P_BUCKET,
+        endpoint_tpl=_R2P_ENDPOINT_TPL,
+        region=_R2P_REGION,
+    )
+elif _PERSIST_ACTIVE == "blob":
+    _BACKEND = _VercelBlobBackend()
+
+
+def _remote_get(pathname: str) -> bytes | None:
+    return _BACKEND.get(pathname) if _BACKEND is not None else None
+
+
+def _remote_put(pathname: str, content: bytes) -> bool:
+    return _BACKEND.put(pathname, content) if _BACKEND is not None else False
+
+
 def _validate_payload(key: str, data: bytes) -> bool:
     try:
         parsed = json.loads(data.decode("utf-8-sig"))
     except Exception as exc:
-        print(f"[BlobFS] {key} 不是合法 JSON: {exc!r}", flush=True)
+        print(f"{_FS_TAG} {key} 不是合法 JSON: {exc!r}", flush=True)
         return False
     if key == "env" and not isinstance(parsed, dict):
         return False
@@ -537,34 +793,41 @@ def _validate_payload(key: str, data: bytes) -> bool:
     return True
 
 
-def blob_hydrate_memory() -> dict[str, bool]:
-    """冷启动：Blob → 内存；缺失则用部署包。"""
+def persist_hydrate_memory() -> dict[str, bool]:
+    """冷启动：远端存储 → 内存；缺失则用部署包。"""
     results: dict[str, bool] = {}
-    if not _blob_enabled:
-        print("[BlobFS] 未配置 BLOB_READ_WRITE_TOKEN，使用 /tmp 文件模式", flush=True)
+    if not _persist_enabled:
+        print("[适配器] 未配置持久化凭据（BLOB_READ_WRITE_TOKEN 或 R2_PERSIST_* / R2_*），使用 /tmp 文件模式", flush=True)
         return results
-    print(
-        f"[BlobFS] 内存直连模式 api={_BLOB_API} access={_BLOB_ACCESS} "
-        f"store={_BLOB_STORE_ID or '?'} prefix={_BLOB_PREFIX!r} version={_BLOB_API_VERSION}",
-        flush=True,
-    )
+    if _PERSIST_ACTIVE == "blob":
+        print(
+            f"{_FS_TAG} 内存直连模式 provider=blob api={_BLOB_API} access={_BLOB_ACCESS} "
+            f"store={_BLOB_STORE_ID or '?'} prefix={_BLOB_PREFIX!r} version={_BLOB_API_VERSION}",
+            flush=True,
+        )
+    else:
+        print(
+            f"{_FS_TAG} 内存直连模式 provider=r2 endpoint={_BACKEND._base if _BACKEND else '?'} "
+            f"bucket={_R2P_BUCKET} prefix={_R2P_PREFIX!r} region={_R2P_REGION}",
+            flush=True,
+        )
     deploy_names = {
         "env": "env.json",
         "servers_manual": None,  # 仓库通常没有
         "servers": "servers.json",
         "chinese_db": "chinese_db.json",
     }
-    for key, pathname in _BLOB_PATHNAMES.items():
+    for key, pathname in _REMOTE_PATHNAMES.items():
         data = None
         try:
-            data = _blob_get(pathname)
+            data = _remote_get(pathname)
         except Exception as exc:
-            print(f"[BlobFS] pull {key} 异常: {exc!r}", flush=True)
+            print(f"{_FS_TAG} pull {key} 异常: {exc!r}", flush=True)
         if data and _validate_payload(key, data):
             with _mem_lock:
                 _mem[key] = data
                 _bump(key)
-            print(f"[BlobFS] 从 Blob 载入 {key} size={len(data)}B", flush=True)
+            print(f"{_FS_TAG} 从远端载入 {key} size={len(data)}B", flush=True)
             results[key] = True
             continue
         # 部署包兜底
@@ -578,12 +841,20 @@ def blob_hydrate_memory() -> dict[str, bool]:
                         with _mem_lock:
                             _mem[key] = raw
                             _bump(key)
-                        print(f"[BlobFS] 部署包兜底 {key} size={len(raw)}B", flush=True)
+                        print(f"{_FS_TAG} 部署包兜底 {key} size={len(raw)}B", flush=True)
                         results[key] = False
+                        # R2：远端缺失时回填部署包内容，首个实例负责播种，
+                        # 后续实例即可直接从 R2 hydrate（幂等，内容相同）。
+                        if _PERSIST_ACTIVE == "r2":
+                            try:
+                                if _remote_put(pathname, raw):
+                                    print(f"{_FS_TAG} 远端缺失，已回填 {key} size={len(raw)}B", flush=True)
+                            except Exception as exc:
+                                print(f"{_FS_TAG} 回填 {key} 异常: {exc!r}", flush=True)
                         continue
                 except Exception as exc:
-                    print(f"[BlobFS] 部署包读取失败 {key}: {exc!r}", flush=True)
-        print(f"[BlobFS] {key} 远端与部署包均无数据", flush=True)
+                    print(f"{_FS_TAG} 部署包读取失败 {key}: {exc!r}", flush=True)
+        print(f"{_FS_TAG} {key} 远端与部署包均无数据", flush=True)
         results[key] = False
     return results
 
@@ -591,7 +862,7 @@ def blob_hydrate_memory() -> dict[str, bool]:
 # ===========================================================================
 # 未启用 Blob：/tmp 回退（复制部署包）
 # ===========================================================================
-if not _blob_enabled:
+if not _persist_enabled:
     for _name, _key in (
         ("servers.json", "servers"),
         ("chinese_db.json", "chinese_db"),
@@ -667,7 +938,7 @@ class _MemTextIO(io.StringIO):
                 data = self.getvalue().encode("utf-8")
                 mem_set(self._key, data, push=True)
             except Exception as exc:
-                print(f"[BlobFS] TextIO close 写回失败 {self._key}: {exc!r}", flush=True)
+                print(f"{_FS_TAG} TextIO close 写回失败 {self._key}: {exc!r}", flush=True)
         super().close()
 
 
@@ -696,11 +967,11 @@ class _MemBinaryIO(io.BytesIO):
                             _mem_tmp[self._tmp_path] = payload
                             _mem_tmp[_norm_path(self._tmp_path)] = payload
                     else:
-                        print(f"[BlobFS] 未知 tmp 写路径 {self._tmp_path}", flush=True)
+                        print(f"{_FS_TAG} 未知 tmp 写路径 {self._tmp_path}", flush=True)
                 elif self._key:
                     mem_set(self._key, data, push=True)
             except Exception as exc:
-                print(f"[BlobFS] BinaryIO close 失败: {exc!r}", flush=True)
+                print(f"{_FS_TAG} BinaryIO close 失败: {exc!r}", flush=True)
         super().close()
 
 
@@ -715,7 +986,7 @@ def _open_patch(file, mode="r", *args, **kwargs):
         return _orig_open(file, mode, *args, **kwargs)
 
     # Blob 未启用时 managed 路径是真实 /tmp 文件
-    if not _blob_enabled and not str(path_s).startswith(_VFS_ROOT):
+    if not _persist_enabled and not str(path_s).startswith(_VFS_ROOT):
         return _orig_open(file, mode, *args, **kwargs)
 
     writing = any(c in mode for c in "wax+")
@@ -755,7 +1026,7 @@ def _open_patch(file, mode="r", *args, **kwargs):
 
 
 def _os_stat_patch(path, *args, **kwargs):
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(path)
         if key is not None:
             st = _mem_stat(key)
@@ -766,7 +1037,7 @@ def _os_stat_patch(path, *args, **kwargs):
 
 
 def _os_path_isfile_patch(path):
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(path)
         if key is not None:
             return mem_exists(key)
@@ -776,7 +1047,7 @@ def _os_path_isfile_patch(path):
 
 
 def _os_path_exists_patch(path):
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(path)
         if key is not None:
             return mem_exists(key)
@@ -786,7 +1057,7 @@ def _os_path_exists_patch(path):
 
 
 def _os_path_getsize_patch(path):
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(path)
         if key is not None:
             data = mem_get(key)
@@ -797,7 +1068,7 @@ def _os_path_getsize_patch(path):
 
 
 def _os_replace_patch(src, dst):
-    if _blob_enabled:
+    if _persist_enabled:
         src_s = os.fspath(src)
         src_n = _norm_path(src_s)
         dst_key = _path_to_key(dst)
@@ -814,7 +1085,7 @@ def _os_replace_patch(src, dst):
             _tkey, data = hit
             key = dst_key or _tkey
             mem_set(key, data, push=True)
-            print(f"[BlobFS] os.replace 提交下载结果 → {key} size={len(data)}B", flush=True)
+            print(f"{_FS_TAG} os.replace 提交下载结果 → {key} size={len(data)}B", flush=True)
             return
         if hit is not None and dst_key is None:
             # dst 无法识别时仍写入反推 key
@@ -834,13 +1105,13 @@ def _os_replace_patch(src, dst):
             return
         # tmp sidecar 但未入 _mem_tmp（空写？）
         if _is_managed_tmp_sidecar(src) and dst_key is not None:
-            print(f"[BlobFS] os.replace 跳过空 tmp {src_s}", flush=True)
+            print(f"{_FS_TAG} os.replace 跳过空 tmp {src_s}", flush=True)
             return
     return _orig_os_replace(src, dst)
 
 
 def _os_remove_patch(path):
-    if _blob_enabled:
+    if _persist_enabled:
         n = _norm_path(path)
         if n in _mem_tmp:
             _mem_tmp.pop(n, None)
@@ -855,19 +1126,19 @@ def _os_remove_patch(path):
 
 
 def _path_is_file_patch(self: Path) -> bool:
-    if _blob_enabled and _path_to_key(self) is not None:
+    if _persist_enabled and _path_to_key(self) is not None:
         return mem_exists(_path_to_key(self))  # type: ignore[arg-type]
     return _orig_path_is_file(self)
 
 
 def _path_exists_patch(self: Path) -> bool:
-    if _blob_enabled and _path_to_key(self) is not None:
+    if _persist_enabled and _path_to_key(self) is not None:
         return mem_exists(_path_to_key(self))  # type: ignore[arg-type]
     return _orig_path_exists(self)
 
 
 def _path_stat_patch(self: Path, *args, **kwargs):
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(self)
         if key is not None:
             st = _mem_stat(key)
@@ -878,7 +1149,7 @@ def _path_stat_patch(self: Path, *args, **kwargs):
 
 
 def _path_read_text_patch(self: Path, encoding: str | None = "utf-8", errors: str | None = None) -> str:
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(self)
         if key is not None:
             data = mem_get(key)
@@ -895,7 +1166,7 @@ def _path_read_text_patch(self: Path, encoding: str | None = "utf-8", errors: st
 
 
 def _path_write_text_patch(self: Path, data: str, encoding: str | None = "utf-8", errors: str | None = None, newline: str | None = None) -> int:
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(self)
         if key is not None:
             enc = encoding or "utf-8"
@@ -906,7 +1177,7 @@ def _path_write_text_patch(self: Path, data: str, encoding: str | None = "utf-8"
 
 
 def _path_read_bytes_patch(self: Path) -> bytes:
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(self)
         if key is not None:
             data = mem_get(key)
@@ -917,7 +1188,7 @@ def _path_read_bytes_patch(self: Path) -> bytes:
 
 
 def _path_write_bytes_patch(self: Path, data: bytes) -> int:
-    if _blob_enabled:
+    if _persist_enabled:
         key = _path_to_key(self)
         if key is not None:
             mem_set(key, bytes(data), push=True)
@@ -931,8 +1202,8 @@ def _path_open_patch(self: Path, mode: str = "r", *args, **kwargs):
 
 
 def _install_vfs_patches() -> None:
-    if not _blob_enabled:
-        print("[BlobFS] 跳过 VFS patch（无 BLOB token，使用真实 /tmp）", flush=True)
+    if not _persist_enabled:
+        print(f"{_FS_TAG} 跳过 VFS patch（未启用远程持久化，使用真实 /tmp）", flush=True)
         return
     builtins.open = _open_patch  # type: ignore[assignment]
     # pathlib / 部分库用 io.open，必须一起补丁
@@ -952,13 +1223,13 @@ def _install_vfs_patches() -> None:
     Path.read_bytes = _path_read_bytes_patch  # type: ignore[method-assign, assignment]
     Path.write_bytes = _path_write_bytes_patch  # type: ignore[method-assign, assignment]
     Path.open = _path_open_patch  # type: ignore[method-assign, assignment]
-    print("[BlobFS] 已安装内存虚拟文件系统 patch（直连 Blob，不写 /tmp）", flush=True)
+    print(f"{_FS_TAG} 已安装内存虚拟文件系统 patch（直连 {_PERSIST_ACTIVE}，不写 /tmp）", flush=True)
 
 
 _install_vfs_patches()
 
 # AppContext 签名在 blob 模式下用内存版本
-if _blob_enabled:
+if _persist_enabled:
     def _config_signature_blob_clean() -> tuple:
         order = ("servers", "servers_manual", "servers_manual", "chinese_db")
         sig: list[Any] = []
@@ -972,7 +1243,7 @@ if _blob_enabled:
     _app.AppContext._config_signature = staticmethod(_config_signature_blob_clean)  # type: ignore[assignment]
 
 # reload_r2_config_if_changed 依赖 mtime；内存模式下用 ver
-if _blob_enabled:
+if _persist_enabled:
     _orig_reload = _app.reload_r2_config_if_changed
 
     def _reload_r2_blob() -> None:
@@ -993,7 +1264,7 @@ if _blob_enabled:
 # ===========================================================================
 # 冷启动
 # ===========================================================================
-_blob_pull_results = blob_hydrate_memory() if _blob_enabled else {}
+_persist_pull_results = persist_hydrate_memory() if _persist_enabled else {}
 
 try:
     _app.apply_r2_config_to_runtime(_app.load_env_config())
@@ -1007,14 +1278,14 @@ _orig_download_remote_file = _app._download_remote_file
 
 
 def _download_remote_file_mem(url: str, dest_path: str) -> str:
-    """Vercel/BlobFS 远程下载，返回 updated / skipped / failed。
+    """Vercel 远程持久化模式下下载，返回 updated / skipped / failed。
 
     与 main.py 的哈希校验语义保持一致：远程 JSON 拉取并校验后，计算
     SHA-256 与当前内存/Blob 内容比较。哈希一致时不调用 mem_set，避免
     重复 PUT Blob、内存版本递增和无意义的配置重载。
     """
     key = _path_to_key(dest_path)
-    if not (_blob_enabled and key is not None):
+    if not (_persist_enabled and key is not None):
         result = _orig_download_remote_file(url, dest_path)
         # 兼容旧版 main.py 的 bool 返回值，同时优先透传新版状态字符串。
         if result is True:
@@ -1045,13 +1316,13 @@ def _download_remote_file_mem(url: str, dest_path: str) -> str:
             ctx_ssl = getattr(_app, "SSL_CTX", None)
             with urllib.request.urlopen(req, timeout=15, context=ctx_ssl) as resp:
                 data = resp.read()
-            # 写入 BlobFS 前先校验 JSON，再计算远程内容哈希。
+            # 写入远端存储前先校验 JSON，再计算远程内容哈希。
             json.loads(data.decode("utf-8-sig"))
             remote_hash = hashlib.sha256(data).hexdigest()
 
             if local_hash == remote_hash:
                 print(
-                    f"[BlobFS] 远程哈希一致，跳过写入 key={key} "
+                    f"{_FS_TAG} 远程哈希一致，跳过写入 key={key} "
                     f"sha256={remote_hash[:12]}",
                     flush=True,
                 )
@@ -1061,7 +1332,7 @@ def _download_remote_file_mem(url: str, dest_path: str) -> str:
             if cand_url != url:
                 print(f"[远程下载] 经代理成功 {cand_url}", flush=True)
             print(
-                f"[BlobFS] 远程内容已更新 key={key} size={len(data)}B "
+                f"{_FS_TAG} 远程内容已更新 key={key} size={len(data)}B "
                 f"{local_hash[:12] if local_hash else 'none'} -> {remote_hash[:12]}",
                 flush=True,
             )
@@ -1071,7 +1342,7 @@ def _download_remote_file_mem(url: str, dest_path: str) -> str:
             print(f"[远程下载] 下载失败 {cand_url} -> blobfs:{key}: {exc}", flush=True)
             continue
     if last_err:
-        print(f"[BlobFS] 远程下载全部失败 key={key}: {last_err!r}", flush=True)
+        print(f"{_FS_TAG} 远程下载全部失败 key={key}: {last_err!r}", flush=True)
     return "failed"
 
 
@@ -1119,9 +1390,9 @@ def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> str:
         except Exception:
             pass
     else:
-        has = (key and mem_exists(key)) or (not _blob_enabled and os.path.isfile(dest))
+        has = (key and mem_exists(key)) or (not _persist_enabled and os.path.isfile(dest))
         if has:
-            print(f"[适配器] 冷启动{label}失败，使用 BlobFS/本地兜底", flush=True)
+            print(f"[适配器] 冷启动{label}失败，使用远端存储/本地兜底", flush=True)
             try:
                 with _app._download_status_lock:
                     st = _app._download_status
@@ -1162,9 +1433,9 @@ try:
 except Exception as exc:
     print(f"[适配器] ctx.refresh_config 失败: {exc!r}", flush=True)
 
-if _blob_enabled:
+if _persist_enabled:
     print(
-        f"[BlobFS] hydrate={_blob_pull_results}；读写均走内存并直连 Blob，不再写 /tmp",
+        f"{_FS_TAG} hydrate={_persist_pull_results}；读写均走内存并直连 {_PERSIST_ACTIVE}，不再写 /tmp",
         flush=True,
     )
 
@@ -1197,33 +1468,33 @@ class handler(_app.MonitorHandler):
         self.path = self._strip_prefix(self.path)
         path_only = (self.path or "/").split("?", 1)[0]
         # 读 snapshot/servers 前从 Blob 拉最新自定义列表，避免多实例内存脏读
-        if _blob_enabled and (
+        if _persist_enabled and (
             path_only.startswith("/api/snapshot")
             or path_only == "/api/servers"
             or path_only.startswith("/api/servers?")
         ):
             try:
-                blob_revalidate_user_config(force=False)
+                persist_revalidate_user_config(force=False)
             except Exception as exc:
-                print(f"[BlobFS] GET revalidate 失败: {exc!r}", flush=True)
+                print(f"{_FS_TAG} GET revalidate 失败: {exc!r}", flush=True)
         super().do_GET()
 
     def do_POST(self) -> None:
         self.path = self._strip_prefix(self.path)
         path_only = (self.path or "/").split("?", 1)[0]
         # 写之前也先 revalidate，降低丢更新/覆盖别人写入的概率
-        if _blob_enabled and (
+        if _persist_enabled and (
             any(path_only == p or path_only.rstrip("/") == p for p in self._SERVERS_WRITE_PREFIXES)
             or any(path_only == p or path_only.rstrip("/") == p for p in self._ENV_WRITE_PREFIXES)
         ):
             try:
                 # 写前强制拉一次，合并到最新
-                blob_revalidate_user_config(force=True)
+                persist_revalidate_user_config(force=True)
             except Exception as exc:
-                print(f"[BlobFS] POST 前 revalidate 失败: {exc!r}", flush=True)
+                print(f"{_FS_TAG} POST 前 revalidate 失败: {exc!r}", flush=True)
         super().do_POST()
         # 兜底：写接口结束后强制 push，保证其它实例能 revalidate 到
-        if not _blob_enabled:
+        if not _persist_enabled:
             return
         try:
             if any(path_only == p or path_only.rstrip("/") == p for p in self._SERVERS_WRITE_PREFIXES):
@@ -1232,16 +1503,16 @@ class handler(_app.MonitorHandler):
                 with _revalidate_lock:
                     _revalidate_at["servers_manual"] = time.time()
                 print(
-                    f"[BlobFS] POST {path_only} 后 force_push servers_manual ok={ok}",
+                    f"{_FS_TAG} POST {path_only} 后 force_push servers_manual ok={ok}",
                     flush=True,
                 )
             elif any(path_only == p or path_only.rstrip("/") == p for p in self._ENV_WRITE_PREFIXES):
                 ok = mem_force_push("env")
                 with _revalidate_lock:
                     _revalidate_at["env"] = time.time()
-                print(f"[BlobFS] POST {path_only} 后 force_push env ok={ok}", flush=True)
+                print(f"{_FS_TAG} POST {path_only} 后 force_push env ok={ok}", flush=True)
         except Exception as exc:
-            print(f"[BlobFS] POST 后 force_push 异常 path={path_only}: {exc!r}", flush=True)
+            print(f"{_FS_TAG} POST 后 force_push 异常 path={path_only}: {exc!r}", flush=True)
             traceback.print_exc()
 
     def do_HEAD(self) -> None:

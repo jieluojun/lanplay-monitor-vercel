@@ -21,7 +21,6 @@
 | `env.json.example` | 环境配置模板（复制成 `env.json` 放进仓库根目录） |
 | `api/index.py` | Vercel 适配层（路由前缀还原 + 时区/日志 + /tmp 重定向 + **GitHub 私有仓库持久化**） |
 | `vercel.json` | Vercel 路由 / 函数配置 |
-| `.github/workflows/*` | deploy / refresh-servers / docker |
 | `Dockerfile` / `docker-compose.yml` | 完整功能镜像 / 一键启动 |
 
 ---
@@ -50,30 +49,11 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 
 按引导完成（Framework 选 **Other**）。
 
-## 自动部署（生产推荐）
-
-⚠️ **接 Vercel 之前必须配置 3 个 GitHub Secret**，否则每次 push workflow 都会因 secret 缺失而跳过部署步骤、抛 warning（push 仍然绿 ✔，但没真正部署到 Vercel）。
-
-### 步骤
-
-1. **fork 本仓库**到你自己的 GitHub（Star 不够，依旧需要 fork 才能在你自己账号下设置 Actions Secret 和 Actions 触发）。
-2. 进入 fork 仓库 → `Settings → Secrets and variables → Actions → New repository secret`，**逐条添加**下面三个值：
-
-   | Secret 名 | 值从哪里拿 |
-   |---|---|
-   | `VERCEL_TOKEN` | Vercel → [Account Settings → Tokens → Create Token](https://vercel.com/account/tokens)。Scopes 选 **Full Access**，TTL 选「No expiration」，创建后**只展示一次**立刻复制 |
-   | `VERCEL_ORG_ID` | Vercel → 团队 / 个人页 → `Settings → General` → 「Your ID」一栏复制（个人账号就是 user id） |
-   | `VERCEL_PROJECT_ID` | Vercel 上**先用一键 deploy 按钮建出这个项目**（首次会自动填好项目名 `lanplay-monitor-vercel`），然后进 Vercel 项目 → `Settings → General` → 「Project ID」复制 |
-
-3. 添加完三个 secret 后再 push 到 `main` / `master`，workflow 会自动跑生产部署；发 PR 自动跑预览部署。
-
-> 不接 Vercel 只想跑 Docker？直接忽略这个 section，下面的「方式二」完全和 GitHub Secrets 无关。
-
 ## Vercel 限制 & 解决方案
 
 | 问题 | 原因 | 解决方案 |
 |---|---|---|
-| 远端服务器列表拉取 | Vercel 不能跑后台线程 | ① 仓库预打包 13 台兜底；② `api/index.py` 冷启动直连拉取最新；③ GitHub Action 每 6h 同步并触发重新部署 |
+| 远端服务器列表拉取 | Vercel 不能跑后台线程 | ① 仓库预打包 13 台兜底；② `api/index.py` 冷启动直连拉取最新 |
 | 添加 / 编辑自定义服务器、保存环境变量、远程列表/标题映射缓存 | Vercel 文件系统只读，默认只写 `/tmp`（冷启动清空） | **推荐**：接 GitHub 私有仓库（配 `GITHUB_REPO_TOKEN` + `GITHUB_REPO_NAME`），适配层内存直连仓库同步 `env.json` / `servers_manual.json` / `servers.json` / `chinese_db.json`（不写 /tmp）；或改用 Docker 挂卷 |
 
 > UDP 局域网扫描在 Vercel 上不可用（平台禁用原始 UDP），只能扫公网服务器；
@@ -280,16 +260,6 @@ docker compose up -d --build
 - **Railway**：New Project → Deploy from GitHub，自动识别 Dockerfile
 - **Render**：New Web Service → 选仓库，Runtime 选 Docker，端口填 `11451`
 - **Fly.io**：`fly launch`（自动识别 Dockerfile）→ `fly deploy`
-
-## GitHub Actions 推镜像
-
-工作流 `.github/workflows/docker.yml` 在 push 时构建并推送到 `ghcr.io/jieluojun/lanplay-monitor-vercel`，所有支持 Docker 的平台直接拉：
-
-```bash
-docker run -d -p 11451:11451 ghcr.io/jieluojun/lanplay-monitor-vercel:latest
-```
-
----
 
 # 本地验证
 

@@ -119,7 +119,7 @@ def _env_first(*names: str, default: str = "") -> str:
 #                       · classic：勾选 repo 权限（私有库必须）
 #                       · fine-grained：该仓库 Contents: Read and write
 #   GITHUB_REPO_BRANCH  存储分支（可选，默认仓库默认分支）
-#   GITHUB_REPO_PREFIX  仓库内存储目录（默认 lanplay/）
+#   GITHUB_REPO_PREFIX  仓库内存储目录（默认 lanplay-monitor-data/）
 #   GITHUB_REPO_API     API 基址（默认 https://api.github.com，一般不用改）
 _GHR_TOKEN = _env_first("GITHUB_REPO_TOKEN")
 _GHR_REPO_RAW = (
@@ -144,7 +144,7 @@ def _ghr_slug() -> str:
 
 
 _GHR_BRANCH = _env_first("GITHUB_REPO_BRANCH")
-_GHR_PREFIX = (_env_first("GITHUB_REPO_PREFIX") or "lanplay/").strip()
+_GHR_PREFIX = (_env_first("GITHUB_REPO_PREFIX") or "lanplay-monitor-data/").strip()
 if _GHR_PREFIX and not _GHR_PREFIX.endswith("/"):
     _GHR_PREFIX += "/"
 _GHR_API = (_env_first("GITHUB_REPO_API") or "https://api.github.com").rstrip("/")

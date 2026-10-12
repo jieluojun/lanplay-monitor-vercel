@@ -5,10 +5,12 @@ Vercel Serverless 入口（薄适配层，不修改 main.py / script.js）。
 
 职责：
 1. import 原始 main.py，复用 MonitorHandler。
-2. 数据持久化后端（二选一，凭据均来自 OS 环境变量）：
-   - Vercel Blob：配置 BLOB_READ_WRITE_TOKEN；
-   - Cloudflare R2：配置 R2_PERSIST_*（缺省回退 R2_*）环境变量；
-   由 PERSIST_PROVIDER 选择（auto=默认，Blob 优先，兼容旧部署）。
+2. 数据持久化后端（GitHub 私有仓库，凭据来自 OS 环境变量，
+   与 sub-store-vercel 一致）：
+   - GITHUB_REPO_TOKEN + GITHUB_REPO_NAME（纯名称 / owner/repo /
+     完整 URL 均可；纯名称时另需 GITHUB_REPO_USER）；
+   - 可选 GITHUB_REPO_BRANCH / GITHUB_REPO_PREFIX；
+   - 读取走条件请求（304 不计 API 限额），写入即产生 commit。
 3. 启用持久化后：
    - 用「内存虚拟文件系统」接管 env/servers/chinese_db 的读写；
    - 读：内存（冷启动从远端存储 / 部署包填充）；
@@ -28,11 +30,12 @@ try:
 except Exception:
     pass
 
+import base64
 import builtins
 import hashlib
-import hmac
 import io
 import json
+import re
 import shutil
 import sys
 import threading
@@ -106,87 +109,66 @@ def _env_first(*names: str, default: str = "") -> str:
     return default
 
 
-_BLOB_API = (os.environ.get("BLOB_API_URL") or "https://vercel.com/api/blob").strip().rstrip("/")
-_BLOB_TOKEN = (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").strip()
-_BLOB_ACCESS = (os.environ.get("BLOB_ACCESS") or "private").strip().lower()
-if _BLOB_ACCESS not in ("private", "public"):
-    _BLOB_ACCESS = "private"
-_BLOB_PREFIX = (os.environ.get("BLOB_PREFIX") or "lanplay/").strip()
-if _BLOB_PREFIX and not _BLOB_PREFIX.endswith("/"):
-    _BLOB_PREFIX += "/"
-_BLOB_API_VERSION = (os.environ.get("BLOB_API_VERSION") or "12").strip() or "12"
-_blob_effective_access = _BLOB_ACCESS
-
-# ---- Cloudflare R2 数据持久化（与 Blob 二选一）----
-# 凭据只从 OS 环境变量读取（R2_PERSIST_*，缺省回退聊天媒体用的 R2_*）：
-# env.json 本身就存在 R2 里，冷启动必须先有凭据才能读到它（避免鸡生蛋），
-# 且用户在网页把「聊天媒体」切到 COS 时，数据持久化不受影响。
-_R2P_ACCOUNT_ID = _env_first("R2_PERSIST_ACCOUNT_ID", "R2_ACCOUNT_ID")
-_R2P_ACCESS_KEY_ID = _env_first("R2_PERSIST_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID")
-_R2P_SECRET_ACCESS_KEY = _env_first("R2_PERSIST_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY")
-_R2P_BUCKET = _env_first("R2_PERSIST_BUCKET", "R2_BUCKET_NAME")
-# 端点模板（可选）：支持 {bucket}/{account} 占位符；缺省虚拟主机风格
-# https://{bucket}.{account}.r2.cloudflarestorage.com；EU 管辖区桶可填
-# https://{bucket}.{account}.eu.r2.cloudflarestorage.com；自建 S3 兼容服务
-# 可填 path-style，如 http://127.0.0.1:9000/{bucket}。
-_R2P_ENDPOINT_TPL = _env_first("R2_PERSIST_ENDPOINT")
-_R2P_REGION = _env_first("R2_PERSIST_REGION") or "auto"
-_R2P_PREFIX = (_env_first("R2_PERSIST_PREFIX") or "lanplay/").strip()
-if _R2P_PREFIX and not _R2P_PREFIX.endswith("/"):
-    _R2P_PREFIX += "/"
-
-
-def _r2_persist_configured() -> bool:
-    return bool(_R2P_ACCOUNT_ID and _R2P_ACCESS_KEY_ID and _R2P_SECRET_ACCESS_KEY and _R2P_BUCKET)
-
-
-# ---- 提供方选择：PERSIST_PROVIDER = auto（默认）/ blob / r2 ----
-_PERSIST_PROVIDER = _env_first("PERSIST_PROVIDER", "PERSIST_BACKEND", default="auto").lower()
-if _PERSIST_PROVIDER not in ("auto", "blob", "r2"):
-    print(f"[适配器] PERSIST_PROVIDER={_PERSIST_PROVIDER!r} 无效，按 auto 处理", flush=True)
-    _PERSIST_PROVIDER = "auto"
-
-
-def _resolve_persist_provider() -> str:
-    """返回实际生效的持久化提供方：'blob' / 'r2' / ''（无，退回 /tmp）。"""
-    if _PERSIST_PROVIDER == "blob":
-        return "blob" if _BLOB_TOKEN else ""
-    if _PERSIST_PROVIDER == "r2":
-        return "r2" if _r2_persist_configured() else ""
-    # auto：兼容旧部署——先 Blob，再 R2，都没有则 /tmp
-    if _BLOB_TOKEN:
-        return "blob"
-    if _r2_persist_configured():
-        return "r2"
-    return ""
-
-
-_PERSIST_ACTIVE = _resolve_persist_provider()
-if _PERSIST_PROVIDER in ("blob", "r2") and not _PERSIST_ACTIVE:
-    print(
-        f"[适配器] PERSIST_PROVIDER={_PERSIST_PROVIDER!r} 但凭据不全，退回 /tmp 文件模式",
-        flush=True,
-    )
-# 远程持久化已启用（Blob 或 R2）；历史变量名保留，语义泛化
-_persist_enabled = bool(_PERSIST_ACTIVE)
-# 日志前缀按后端区分
-_FS_TAG = {"blob": "[BlobFS]", "r2": "[R2FS]"}.get(_PERSIST_ACTIVE, "[VFS]")
-
-
-def _parse_store_id_from_token(token: str) -> str:
-    parts = (token or "").split("_")
-    if len(parts) >= 4:
-        return parts[3]
-    return ""
-
-
-_BLOB_STORE_ID = (
-    (os.environ.get("BLOB_STORE_ID") or "").strip().removeprefix("store_")
-    or _parse_store_id_from_token(_BLOB_TOKEN)
+# ---- GitHub 私有仓库数据持久化 ----
+# 凭据只从 OS 环境变量读取（env.json 本身就存在仓库里，冷启动必须先有
+# 凭据才能读到它，避免鸡生蛋；且聊天媒体的 R2/COS 凭据在 env.json 里
+# 由 main.py 读取，与这里完全独立）：
+#   GITHUB_REPO_USER    GitHub 用户名（或组织名）
+#   GITHUB_REPO_NAME    仓库名称：纯名称 / owner/repo / 完整 URL 均可
+#   GITHUB_REPO_TOKEN   Personal Access Token
+#                       · classic：勾选 repo 权限（私有库必须）
+#                       · fine-grained：该仓库 Contents: Read and write
+#   GITHUB_REPO_BRANCH  存储分支（可选，默认仓库默认分支）
+#   GITHUB_REPO_PREFIX  仓库内存储目录（默认 lanplay/）
+#   GITHUB_REPO_API     API 基址（默认 https://api.github.com，一般不用改）
+_GHR_TOKEN = _env_first("GITHUB_REPO_TOKEN")
+_GHR_REPO_RAW = (
+    _env_first("GITHUB_REPO_NAME")
+    .removeprefix("https://github.com/")
+    .removeprefix("http://github.com/")
+    .removesuffix(".git")
+    .strip("/")
 )
 
-# 逻辑名 → 远端对象路径（Blob pathname / R2 object key）
-_ACTIVE_PREFIX = _R2P_PREFIX if _PERSIST_ACTIVE == "r2" else _BLOB_PREFIX
+
+def _ghr_slug() -> str:
+    """返回 owner/repo；仓库名为纯名称时用 GITHUB_REPO_USER 补全。"""
+    if "/" in _GHR_REPO_RAW:
+        owner, _, repo = _GHR_REPO_RAW.partition("/")
+        if owner and repo:
+            return f"{owner}/{repo}"
+    user = _env_first("GITHUB_REPO_USER")
+    if user and _GHR_REPO_RAW:
+        return f"{user}/{_GHR_REPO_RAW}"
+    return ""
+
+
+_GHR_BRANCH = _env_first("GITHUB_REPO_BRANCH")
+_GHR_PREFIX = (_env_first("GITHUB_REPO_PREFIX") or "lanplay/").strip()
+if _GHR_PREFIX and not _GHR_PREFIX.endswith("/"):
+    _GHR_PREFIX += "/"
+_GHR_API = (_env_first("GITHUB_REPO_API") or "https://api.github.com").rstrip("/")
+
+
+def _github_repo_configured() -> bool:
+    return bool(_GHR_TOKEN and _ghr_slug())
+
+
+# ---- 提供方：GitHub 私有仓库（唯一）；未配置则退回 /tmp ----
+_PERSIST_ACTIVE = "github" if _github_repo_configured() else ""
+if (_GHR_TOKEN or _GHR_REPO_RAW or _env_first("GITHUB_REPO_USER")) and not _PERSIST_ACTIVE:
+    print(
+        "[适配器] 检测到 GITHUB_REPO_* 变量但配置不全（需要 TOKEN + 仓库名），退回 /tmp 文件模式",
+        flush=True,
+    )
+# 远程持久化已启用（GitHub 私有仓库）
+_persist_enabled = bool(_PERSIST_ACTIVE)
+# 日志前缀
+_FS_TAG = "[GitFS]" if _PERSIST_ACTIVE else "[VFS]"
+
+
+# 逻辑名 → 仓库内文件路径
+_ACTIVE_PREFIX = _GHR_PREFIX
 _REMOTE_PATHNAMES: dict[str, str] = {
     "env": f"{_ACTIVE_PREFIX}env.json",
     "servers_manual": f"{_ACTIVE_PREFIX}servers_manual.json",
@@ -462,310 +444,186 @@ def _mem_stat(key: str) -> os.stat_result | None:
 
 
 # ===========================================================================
-# Blob HTTP
+# GitHub 私有仓库后端（Contents API，零第三方依赖）
 # ===========================================================================
-def _blob_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
-    h = {
-        "authorization": f"Bearer {_BLOB_TOKEN}",
-        "x-api-version": _BLOB_API_VERSION,
-        "user-agent": "lanplay-monitor-vercel-adapter/2.0-blobfs",
-    }
-    if _BLOB_STORE_ID:
-        h["x-vercel-blob-store-id"] = _BLOB_STORE_ID
-    if extra:
-        h.update(extra)
-    return h
+class _GithubRepoBackend:
+    """数据持久化 GitHub 私有仓库后端（与 sub-store-vercel 一致）。
 
-
-def _blob_request(
-    method: str,
-    url: str,
-    *,
-    data: bytes | None = None,
-    headers: dict[str, str] | None = None,
-    timeout: float = 30.0,
-) -> tuple[int, bytes]:
-    req = urllib.request.Request(url, data=data, method=method)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return int(resp.status), resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read() or b""
-        except Exception:
-            body = b""
-        return int(e.code), body
-    except Exception as exc:
-        print(f"[Blob] 请求异常 {method} {url}: {exc!r}", flush=True)
-        return 0, str(exc).encode("utf-8", errors="replace")
-
-
-def _blob_cdn_url(pathname: str, access: str | None = None) -> str:
-    acc = access or _blob_effective_access
-    sid = _BLOB_STORE_ID or "unknown"
-    pn = pathname.lstrip("/")
-    enc = "/".join(urllib.parse.quote(seg, safe="") for seg in pn.split("/"))
-    return f"https://{sid}.{acc}.blob.vercel-storage.com/{enc}"
-
-
-def _blob_put(pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
-    global _blob_effective_access
-    if not _persist_enabled:
-        return False
-    qs = urllib.parse.urlencode({"pathname": pathname})
-    url = f"{_BLOB_API}/?{qs}"
-
-    def _do(access: str) -> tuple[int, bytes]:
-        headers = _blob_headers(
-            {
-                "x-vercel-blob-access": access,
-                "x-content-type": content_type,
-                "x-add-random-suffix": "0",
-                "x-allow-overwrite": "1",
-                "x-cache-control-max-age": "60",
-            }
-        )
-        return _blob_request("PUT", url, data=content, headers=headers, timeout=45.0)
-
-    status, body = _do(_blob_effective_access)
-    if status != 200:
-        msg = body.decode("utf-8", errors="replace")
-        alt = "public" if _blob_effective_access == "private" else "private"
-        if "access" in msg.lower() or "private store" in msg.lower() or "public store" in msg.lower():
-            print(f"[Blob] PUT access={_blob_effective_access} 失败，尝试 {alt}…", flush=True)
-            status2, body2 = _do(alt)
-            if status2 == 200:
-                _blob_effective_access = alt
-                status, body = status2, body2
-            else:
-                print(f"[Blob] PUT 失败 pathname={pathname} status={status} body={body[:300]!r}", flush=True)
-                return False
-        else:
-            print(f"[Blob] PUT 失败 pathname={pathname} status={status} body={body[:300]!r}", flush=True)
-            return False
-    print(
-        f"[Blob] PUT 成功 pathname={pathname} size={len(content)}B access={_blob_effective_access}",
-        flush=True,
-    )
-    return True
-
-
-def _blob_get(pathname: str) -> bytes | None:
-    if not _persist_enabled:
-        return None
-    if _BLOB_STORE_ID:
-        for acc in (_blob_effective_access, "private", "public"):
-            cdn = _blob_cdn_url(pathname, acc)
-            fetch_url = cdn + ("&" if "?" in cdn else "?") + "cache=0"
-            status, body = _blob_request("GET", fetch_url, headers=_blob_headers(), timeout=45.0)
-            if status == 200 and body is not None:
-                return body
-            if status == 404:
-                return None
-    # list 兜底
-    qs = urllib.parse.urlencode({"prefix": _BLOB_PREFIX, "limit": "100"})
-    status, body = _blob_request("GET", f"{_BLOB_API}?{qs}", headers=_blob_headers(), timeout=20.0)
-    if status != 200:
-        return None
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except Exception:
-        return None
-    for b in data.get("blobs") or []:
-        if not isinstance(b, dict):
-            continue
-        if str(b.get("pathname") or "") == pathname:
-            u = str(b.get("url") or "").strip()
-            if not u:
-                continue
-            st2, body2 = _blob_request(
-                "GET",
-                u + ("&" if "?" in u else "?") + "cache=0",
-                headers=_blob_headers(),
-                timeout=45.0,
-            )
-            if st2 == 200:
-                return body2
-    return None
-
-
-# ===========================================================================
-# Cloudflare R2 后端（S3 兼容 API + AWS Signature V4，零第三方依赖）
-# ===========================================================================
-class _CloudflareR2Backend:
-    """数据持久化 R2 后端。
-
-    签名实现独立于 main.py 的聊天媒体存储（后者读运行时全局变量，
-    可能被 env.json 切到 COS）；持久化凭据固定来自 OS 环境变量。
+    - 读：GET /repos/{slug}/contents/{path}，带 If-None-Match 条件请求；
+      内容未变返回 304（不计 REST API 速率限额）。
+      文件 > 1MB 时 contents JSON 不含 content，用 Git Blobs API 兜底。
+    - 写：PUT /repos/{slug}/contents/{path}，自动携带 sha；遇 409/422
+      （其它实例先提交导致 sha 过期）时取最新 sha 重试一次。
+    - 404 视为对象不存在（返回 None）；其它错误抛异常（调用方保留本地数据）。
     """
 
-    label = "R2"
+    label = "GithubRepo"
 
-    def __init__(
-        self,
-        account_id: str,
-        access_key_id: str,
-        secret_access_key: str,
-        bucket: str,
-        endpoint_tpl: str = "",
-        region: str = "auto",
-    ) -> None:
-        self._access_key = access_key_id
-        self._secret = secret_access_key
-        self._region = region or "auto"
-        tpl = (endpoint_tpl or "").strip() or "https://{bucket}.{account}.r2.cloudflarestorage.com"
-        if "://" not in tpl:
-            tpl = "https://" + tpl
-        # 端点模板支持 {bucket}/{account} 占位符；base 形如
-        # https://<bucket>.<account>.r2.cloudflarestorage.com（虚拟主机风格）
-        # 或 http://host:9000/<bucket>（path-style，自建 S3 兼容服务）
-        self._base = tpl.format(bucket=bucket, account=account_id).rstrip("/")
-        self._host = urllib.parse.urlparse(self._base).netloc
-        # path-style 端点的 base 含 /<bucket> 前缀，必须一并纳入签名 CanonicalURI
-        self._uri_prefix = urllib.parse.urlparse(self._base).path.rstrip("/")
+    def __init__(self, slug: str, token: str, branch: str = "", api_base: str = "") -> None:
+        self._slug = slug
+        self._token = token
+        self._branch = branch
+        self._api = (api_base or "https://api.github.com").rstrip("/")
+        # pathname -> {"sha": str, "etag": str, "data": bytes}
+        self._cache: dict[str, dict[str, Any]] = {}
 
-    # ---- AWS Signature V4（service=s3）----
-    def _authorize(
-        self, method: str, uri: str, headers: dict[str, str], payload: bytes
-    ) -> tuple[str, str]:
-        now = _dt_cls.now(_dt_tz.utc)
-        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-        date_stamp = now.strftime("%Y%m%d")
-        hm = {k.lower(): str(v).strip() for k, v in headers.items()}
-        hm["x-amz-date"] = amz_date
-        names = sorted(hm)
-        signed_headers = ";".join(names)
-        canonical_headers = "".join(f"{k}:{hm[k]}\n" for k in names)
-        payload_hash = hashlib.sha256(payload).hexdigest()
-        canonical_request = "\n".join((method, uri, "", canonical_headers, signed_headers, payload_hash))
-        scope = f"{date_stamp}/{self._region}/s3/aws4_request"
-        string_to_sign = "\n".join(
-            (
-                "AWS4-HMAC-SHA256",
-                amz_date,
-                scope,
-                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-            )
-        )
-
-        def _h(key: bytes, msg: str) -> bytes:
-            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-        k = _h(("AWS4" + self._secret).encode("utf-8"), date_stamp)
-        k = _h(k, self._region)
-        k = _h(k, "s3")
-        k = _h(k, "aws4_request")
-        signature = hmac.new(k, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-        auth = (
-            f"AWS4-HMAC-SHA256 Credential={self._access_key}/{scope}, "
-            f"SignedHeaders={signed_headers}, Signature={signature}"
-        )
-        return auth, amz_date
+    # ---- 基础请求 ----
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        h = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "lanplay-monitor-vercel-adapter",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if extra:
+            h.update(extra)
+        return h
 
     def _request(
         self,
         method: str,
-        key: str,
+        url: str,
         *,
-        payload: bytes = b"",
-        content_type: str = "application/json; charset=utf-8",
-        timeout: float = 30.0,
-    ) -> tuple[int, bytes, str]:
-        """返回 (status, body, etag)；网络异常时 status=0。"""
-        # 签名用 CanonicalURI（path-style 端点须含 base 自带的 /<bucket> 前缀）；
-        # 请求 URL 则直接拼 base（base 已含该前缀，勿重复）。
-        quoted = urllib.parse.quote(key.lstrip("/"), safe="/")
-        uri = f"{self._uri_prefix}/{quoted}"
-        url = f"{self._base}/{quoted}"
-        headers: dict[str, str] = {
-            "Host": self._host,
-            "x-amz-content-sha256": hashlib.sha256(payload).hexdigest(),
-        }
-        if method == "PUT":
-            headers["Content-Type"] = content_type
-            headers["Content-Length"] = str(len(payload))
-        auth, amz_date = self._authorize(method, uri, headers, payload)
-        headers["Authorization"] = auth
-        headers["x-amz-date"] = amz_date
-        req = urllib.request.Request(
-            url,
-            data=payload if method == "PUT" else None,
-            method=method,
-            headers=headers,
-        )
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 20.0,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        req = urllib.request.Request(url, data=data, method=method)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read()
-                return int(resp.status), body, str(resp.headers.get("ETag", "") or "")
+                hdrs = {str(k): str(v) for k, v in (resp.headers or {}).items()}
+                return int(resp.status), resp.read(), hdrs
         except urllib.error.HTTPError as e:
             try:
                 body = e.read() or b""
             except Exception:
                 body = b""
-            return int(e.code), body, ""
+            hdrs = {str(k): str(v) for k, v in (e.headers or {}).items()} if e.headers else {}
+            return int(e.code), body, hdrs
         except Exception as exc:
-            print(f"{_FS_TAG} {method} 请求异常 key={key}: {exc!r}", flush=True)
-            return 0, str(exc).encode("utf-8", errors="replace"), ""
+            print(f"[GitFS] 请求异常 {method} {url}: {exc!r}", flush=True)
+            raise
 
-    # ---- 后端统一接口 ----
+    def _contents_url(self, pathname: str, *, with_ref: bool = True) -> str:
+        enc = "/".join(urllib.parse.quote(seg, safe="") for seg in pathname.split("/") if seg)
+        url = f"{self._api}/repos/{self._slug}/contents/{enc}"
+        if with_ref and self._branch:
+            url += f"?ref={urllib.parse.quote(self._branch, safe='')}"
+        return url
+
+    # ---- 读 ----
     def get(self, pathname: str) -> bytes | None:
-        key = pathname.lstrip("/")
-        status, body, _etag = self._request("GET", key, timeout=30.0)
-        if status == 200:
-            return body
+        cached = self._cache.get(pathname)
+        extra: dict[str, str] = {}
+        if cached and cached.get("etag"):
+            extra["If-None-Match"] = cached["etag"]
+        status, body, hdrs = self._request(
+            "GET", self._contents_url(pathname), headers=self._headers(extra), timeout=20.0
+        )
+        if status == 304:
+            if cached is not None:
+                return cached["data"]
+            raise RuntimeError("GitHub 304 但本地无缓存（不应发生）")
         if status == 404:
             return None
-        if status in (401, 403):
-            print(
-                f"{_FS_TAG} GET 鉴权失败（检查 R2_PERSIST_ACCESS_KEY_ID / "
-                f"R2_PERSIST_SECRET_ACCESS_KEY 及 Token 的对象读写权限）key={key}",
-                flush=True,
-            )
+        if status != 200:
+            raise RuntimeError(f"GitHub contents API {status} ({pathname}): {body[:200]!r}")
+        try:
+            meta = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"GitHub contents 响应非 JSON ({pathname}): {exc!r}")
+        if not isinstance(meta, dict) or meta.get("type") != "file":
             return None
-        print(f"{_FS_TAG} GET 失败 key={key} status={status} body={body[:200]!r}", flush=True)
-        return None
+        sha = str(meta.get("sha") or "")
+        etag = hdrs.get("ETag") or hdrs.get("etag") or (f'"{sha}"' if sha else "")
+        content = meta.get("content")
+        data: bytes | None = None
+        if content and not meta.get("truncated"):
+            data = base64.b64decode(re.sub(r"\s+", "", str(content)))
+        elif sha:
+            # >1MB：contents JSON 不带 content，走 Git Blobs API（上限 100MB）
+            burl = f"{self._api}/repos/{self._slug}/git/blobs/{sha}"
+            st2, body2, _ = self._request("GET", burl, headers=self._headers(), timeout=30.0)
+            if st2 != 200:
+                raise RuntimeError(f"GitHub blobs API {st2} ({pathname})")
+            try:
+                blob = json.loads(body2.decode("utf-8"))
+            except Exception as exc:
+                raise RuntimeError(f"GitHub blobs 响应非 JSON ({pathname}): {exc!r}")
+            if blob.get("encoding") != "base64" or not blob.get("content"):
+                return None
+            data = base64.b64decode(re.sub(r"\s+", "", str(blob["content"])))
+        if data is None:
+            return None
+        self._cache[pathname] = {"sha": sha, "etag": etag, "data": data}
+        return data
 
+    # ---- 写 ----
     def put(self, pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
-        key = pathname.lstrip("/")
-        status, body, etag = self._request("PUT", key, payload=content, content_type=content_type, timeout=45.0)
-        if 200 <= status < 300:
-            tag = etag.strip().strip('"')[:16]
-            print(f"{_FS_TAG} PUT 成功 key={key} size={len(content)}B etag={tag}", flush=True)
-            return True
-        if status in (401, 403):
-            print(f"{_FS_TAG} PUT 鉴权失败（检查 R2 Token 的 Object Read & Write 权限）key={key}", flush=True)
+        payload: dict[str, Any] = {
+            "message": f"lanplay-monitor: sync {pathname.rsplit('/', 1)[-1]} ({_dt_cls.now(_dt_tz.utc).isoformat()})",
+            "content": base64.b64encode(bytes(content)).decode("ascii"),
+        }
+        if self._branch:
+            payload["branch"] = self._branch
+        url = self._contents_url(pathname, with_ref=False)
+
+        def _attempt(sha: str | None) -> tuple[int, bytes]:
+            body = dict(payload)
+            if sha:
+                body["sha"] = sha
+            status_, body_ = self._request(
+                "PUT",
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers=self._headers({"Content-Type": "application/json"}),
+                timeout=30.0,
+            )[:2]
+            return status_, body_
+
+        cached = self._cache.get(pathname)
+        status, body = _attempt(cached.get("sha") if cached else None)
+        if status in (409, 422):
+            # sha 过期（其它实例先提交）或文件已存在但未带 sha → 取最新 sha 重试一次
+            sha = None
+            try:
+                st2, body2, _ = self._request(
+                    "GET", self._contents_url(pathname), headers=self._headers(), timeout=20.0
+                )
+                if st2 == 200:
+                    sha = str(json.loads(body2.decode("utf-8")).get("sha") or "") or None
+            except Exception:
+                sha = None
+            status, body = _attempt(sha)
+        if status not in (200, 201):
+            print(f"[GitFS] PUT 失败 path={pathname} status={status} body={body[:300]!r}", flush=True)
             return False
-        print(f"{_FS_TAG} PUT 失败 key={key} status={status} body={body[:200]!r}", flush=True)
-        return False
-
-
-class _VercelBlobBackend:
-    """Blob 薄包装：沿用上方 Blob REST 实现，接口与 R2 后端一致。"""
-
-    label = "Blob"
-
-    def get(self, pathname: str) -> bytes | None:
-        return _blob_get(pathname)
-
-    def put(self, pathname: str, content: bytes, content_type: str = "application/json; charset=utf-8") -> bool:
-        return _blob_put(pathname, content, content_type)
+        sha = ""
+        try:
+            sha = str((json.loads(body.decode("utf-8")).get("content") or {}).get("sha") or "")
+        except Exception:
+            sha = ""
+        # 自写即最新：更新缓存，后续条件请求 304 直接过
+        self._cache[pathname] = {
+            "sha": sha,
+            "etag": f'"{sha}"' if sha else "",
+            "data": bytes(content),
+        }
+        print(f"[GitFS] PUT 成功 path={pathname} size={len(content)}B", flush=True)
+        return True
 
 
 # 实例化生效后端 + 统一读写入口（VFS 层只认这两个函数）
 _BACKEND = None
-if _PERSIST_ACTIVE == "r2":
-    _BACKEND = _CloudflareR2Backend(
-        account_id=_R2P_ACCOUNT_ID,
-        access_key_id=_R2P_ACCESS_KEY_ID,
-        secret_access_key=_R2P_SECRET_ACCESS_KEY,
-        bucket=_R2P_BUCKET,
-        endpoint_tpl=_R2P_ENDPOINT_TPL,
-        region=_R2P_REGION,
+if _PERSIST_ACTIVE == "github":
+    _BACKEND = _GithubRepoBackend(
+        slug=_ghr_slug(),
+        token=_GHR_TOKEN,
+        branch=_GHR_BRANCH,
+        api_base=_GHR_API,
     )
-elif _PERSIST_ACTIVE == "blob":
-    _BACKEND = _VercelBlobBackend()
 
 
 def _remote_get(pathname: str) -> bytes | None:
@@ -797,20 +655,13 @@ def persist_hydrate_memory() -> dict[str, bool]:
     """冷启动：远端存储 → 内存；缺失则用部署包。"""
     results: dict[str, bool] = {}
     if not _persist_enabled:
-        print("[适配器] 未配置持久化凭据（BLOB_READ_WRITE_TOKEN 或 R2_PERSIST_* / R2_*），使用 /tmp 文件模式", flush=True)
+        print("[适配器] 未配置持久化凭据（GITHUB_REPO_TOKEN + GITHUB_REPO_NAME），使用 /tmp 文件模式", flush=True)
         return results
-    if _PERSIST_ACTIVE == "blob":
-        print(
-            f"{_FS_TAG} 内存直连模式 provider=blob api={_BLOB_API} access={_BLOB_ACCESS} "
-            f"store={_BLOB_STORE_ID or '?'} prefix={_BLOB_PREFIX!r} version={_BLOB_API_VERSION}",
-            flush=True,
-        )
-    else:
-        print(
-            f"{_FS_TAG} 内存直连模式 provider=r2 endpoint={_BACKEND._base if _BACKEND else '?'} "
-            f"bucket={_R2P_BUCKET} prefix={_R2P_PREFIX!r} region={_R2P_REGION}",
-            flush=True,
-        )
+    print(
+        f"{_FS_TAG} 内存直连模式 provider=github repo={_ghr_slug()} "
+        f"branch={_GHR_BRANCH or '默认'} prefix={_GHR_PREFIX!r}",
+        flush=True,
+    )
     deploy_names = {
         "env": "env.json",
         "servers_manual": None,  # 仓库通常没有
@@ -819,9 +670,11 @@ def persist_hydrate_memory() -> dict[str, bool]:
     }
     for key, pathname in _REMOTE_PATHNAMES.items():
         data = None
+        pull_error = False
         try:
             data = _remote_get(pathname)
         except Exception as exc:
+            pull_error = True
             print(f"{_FS_TAG} pull {key} 异常: {exc!r}", flush=True)
         if data and _validate_payload(key, data):
             with _mem_lock:
@@ -843,9 +696,10 @@ def persist_hydrate_memory() -> dict[str, bool]:
                             _bump(key)
                         print(f"{_FS_TAG} 部署包兜底 {key} size={len(raw)}B", flush=True)
                         results[key] = False
-                        # R2：远端缺失时回填部署包内容，首个实例负责播种，
-                        # 后续实例即可直接从 R2 hydrate（幂等，内容相同）。
-                        if _PERSIST_ACTIVE == "r2":
+                        # 远端确认缺失（404）时回填部署包内容，首个实例负责播种，
+                        # 后续实例即可直接从仓库 hydrate（幂等，内容相同）。
+                        # 拉取异常（网络抖动等）时不回填，避免旧数据覆盖远端。
+                        if data is None and not pull_error:
                             try:
                                 if _remote_put(pathname, raw):
                                     print(f"{_FS_TAG} 远端缺失，已回填 {key} size={len(raw)}B", flush=True)
@@ -1228,9 +1082,9 @@ def _install_vfs_patches() -> None:
 
 _install_vfs_patches()
 
-# AppContext 签名在 blob 模式下用内存版本
+# AppContext 签名在持久化模式下用内存版本
 if _persist_enabled:
-    def _config_signature_blob_clean() -> tuple:
+    def _config_signature_mem_clean() -> tuple:
         order = ("servers", "servers_manual", "servers_manual", "chinese_db")
         sig: list[Any] = []
         for k in order:
@@ -1240,25 +1094,25 @@ if _persist_enabled:
             sig.append(None if data is None else (ver, len(data)))
         return tuple(sig)
 
-    _app.AppContext._config_signature = staticmethod(_config_signature_blob_clean)  # type: ignore[assignment]
+    _app.AppContext._config_signature = staticmethod(_config_signature_mem_clean)  # type: ignore[assignment]
 
 # reload_r2_config_if_changed 依赖 mtime；内存模式下用 ver
 if _persist_enabled:
     _orig_reload = _app.reload_r2_config_if_changed
 
-    def _reload_r2_blob() -> None:
+    def _reload_env_config_mem() -> None:
         global _env_applied_ver
         with _mem_lock:
             ver = _mem_ver.get("env", 0)
             has = _mem.get("env") is not None
-        if has and ver == getattr(_reload_r2_blob, "_ver", None):
+        if has and ver == getattr(_reload_env_config_mem, "_ver", None):
             return
         cfg = _app.load_env_config()
         _app.apply_r2_config_to_runtime(cfg)
-        _reload_r2_blob._ver = ver  # type: ignore[attr-defined]
+        _reload_env_config_mem._ver = ver  # type: ignore[attr-defined]
 
-    _reload_r2_blob._ver = None  # type: ignore[attr-defined]
-    _app.reload_r2_config_if_changed = _reload_r2_blob  # type: ignore[assignment]
+    _reload_env_config_mem._ver = None  # type: ignore[attr-defined]
+    _app.reload_r2_config_if_changed = _reload_env_config_mem  # type: ignore[assignment]
 
 
 # ===========================================================================
@@ -1281,8 +1135,8 @@ def _download_remote_file_mem(url: str, dest_path: str) -> str:
     """Vercel 远程持久化模式下下载，返回 updated / skipped / failed。
 
     与 main.py 的哈希校验语义保持一致：远程 JSON 拉取并校验后，计算
-    SHA-256 与当前内存/Blob 内容比较。哈希一致时不调用 mem_set，避免
-    重复 PUT Blob、内存版本递增和无意义的配置重载。
+    SHA-256 与当前内存/仓库内容比较。哈希一致时不调用 mem_set，避免
+    重复 PUT 仓库、内存版本递增和无意义的配置重载。
     """
     key = _path_to_key(dest_path)
     if not (_persist_enabled and key is not None):
@@ -1400,12 +1254,12 @@ def _cold_fetch(url: str, dest: str, label: str, status_key: str) -> str:
                         st.setdefault("servers_last_success", time.time())
                         if not st.get("servers_last_success"):
                             st["servers_last_success"] = time.time()
-                        st["servers_last_error"] = "GitHub 拉取失败，使用 Blob/内存兜底"
+                        st["servers_last_error"] = "GitHub 拉取失败，使用仓库/内存兜底"
                         st["remote_servers_available"] = True
                     elif status_key == "chinese_db":
                         if not st.get("chinese_db_last_success"):
                             st["chinese_db_last_success"] = time.time()
-                        st["chinese_db_last_error"] = "GitHub 拉取失败，使用 Blob/内存兜底"
+                        st["chinese_db_last_error"] = "GitHub 拉取失败，使用仓库/内存兜底"
             except Exception:
                 pass
         else:
@@ -1441,7 +1295,7 @@ if _persist_enabled:
 
 
 class handler(_app.MonitorHandler):
-    """路由前缀还原；写操作结束后强制把相关 key push 到 Blob。"""
+    """路由前缀还原；写操作结束后强制把相关 key push 到 GitHub 仓库。"""
 
     _PREFIX = "/api/index"
 

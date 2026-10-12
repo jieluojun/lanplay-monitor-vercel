@@ -84,10 +84,10 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 配置 **GitHub 私有仓库** 后，适配层使用 **内存虚拟文件系统（GitFS）直连仓库（Contents API）**，**不再写入 `/tmp`**：
 
 1. **冷启动 hydrate**：从私有仓库拉下列文件进内存（确认缺失时用部署包兜底并回填仓库）
-   - `lanplay/env.json` — 环境变量配置（含安全密码）
-   - `lanplay/servers_manual.json` — 用户自定义服务器
-   - `lanplay/servers.json` — 远程公网服务器列表
-   - `lanplay/chinese_db.json` — 游戏标题映射
+   - `lanplay-monitor-data/env.json` — 环境变量配置（含安全密码）
+   - `lanplay-monitor-data/servers_manual.json` — 用户自定义服务器
+   - `lanplay-monitor-data/servers.json` — 远程公网服务器列表
+   - `lanplay-monitor-data/chinese_db.json` — 游戏标题映射
 2. **运行时读写**：`main.py` 仍按「本地文件路径」调用；适配层把路径映射到内存，**读内存 / 写内存并立刻提交到仓库**（每次写入产生一个 commit，历史可回滚）
 3. **多实例一致性**：读关键接口前按 TTL 从仓库重新拉取（条件请求，内容未变返回 304，不计 API 限额）
 4. **远程下载**：GitHub 拉取后计算 SHA-256；与当前内存/仓库内容一致时跳过写入，只有内容变化才更新内存 + 仓库（不经 `/tmp`）
@@ -107,7 +107,7 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
    - `GITHUB_REPO_USER`（仓库名为纯名称时必需）
 4. 重新部署一次。打开「实时运行日志」，应看到：
    - `[GitFS] 内存直连模式 provider=github …`
-   - 在网页保存一次配置或添加服务器后：`[GitFS] PUT 成功 …`，私有仓库出现 `lanplay/` 目录与 commit
+   - 在网页保存一次配置或添加服务器后：`[GitFS] PUT 成功 …`，私有仓库出现 `lanplay-monitor-data/` 目录与 commit
 
 ### 相关环境变量
 
@@ -117,7 +117,7 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 | `GITHUB_REPO_NAME` | （空） | 数据仓库名称：纯名称 / `owner/repo` / 完整 URL 均可 |
 | `GITHUB_REPO_USER` | （空） | GitHub 用户名；`GITHUB_REPO_NAME` 为纯名称时必需 |
 | `GITHUB_REPO_BRANCH` | 仓库默认分支 | 存储分支 |
-| `GITHUB_REPO_PREFIX` | `lanplay/` | 仓库内存储目录前缀 |
+| `GITHUB_REPO_PREFIX` | `lanplay-monitor-data/` | 仓库内存储目录前缀 |
 | `GITHUB_REPO_API` | `https://api.github.com` | API 基址（一般不用改） |
 | `PERSIST_REVALIDATE_TTL` | `3` | 多实例读路径重新拉取远端的 TTL（秒） |
 
@@ -200,7 +200,7 @@ Settings → Environment Variables** 里直接配同名变量即可生效，**�
 | — | `GITHUB_REPO_NAME` | str | `""` | 数据仓库名称：纯名称 / `owner/repo` / 完整 URL 均可 |
 | — | `GITHUB_REPO_USER` | str | `""` | GitHub 用户名；仓库名为纯名称时必需 |
 | — | `GITHUB_REPO_BRANCH` | str | `""` | 存储分支（默认仓库默认分支） |
-| — | `GITHUB_REPO_PREFIX` | str | `"lanplay/"` | 仓库内存储目录前缀 |
+| — | `GITHUB_REPO_PREFIX` | str | `"lanplay-monitor-data/"` | 仓库内存储目录前缀 |
 | — | `GITHUB_REPO_API` | str | `https://api.github.com` | GitHub API 基址（一般不用改） |
 | — | `PERSIST_REVALIDATE_TTL` | float | `3` | 多实例读路径重新拉取远端的 TTL（秒） |
 
@@ -254,7 +254,7 @@ GITHUB_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
 GITHUB_REPO_NAME=sub-store-data   # 或 owner/repo 形式
 # GITHUB_REPO_USER=your-username  # 仓库名为纯名称时需要
 # GITHUB_REPO_BRANCH=main
-# GITHUB_REPO_PREFIX=lanplay/
+# GITHUB_REPO_PREFIX=lanplay-monitor-data/
 
 # 内存 / 并发
 MAX_WORKERS=8

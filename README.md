@@ -1,12 +1,12 @@
 # LAN-Play 房间监控 · 一键部署包
 
-基于原版 `main.py` / `script.js`，增加安全密码明文化与环境变量支持；`api/index.py` 为 Vercel 适配层（含 Blob / Cloudflare R2 持久化）+ 部署相关配置。
+基于原版 `main.py` / `script.js`，增加安全密码明文化与环境变量支持；`api/index.py` 为 Vercel 适配层（含 GitHub 私有仓库持久化）+ 部署相关配置。
 
 仓库地址：`https://github.com/jieluojun/lanplay-monitor-vercel`
 
 | 部署方式 | 适合场景 | 服务器列表 | 添加自定义服务器 / 环境变量配置 |
 |---|---|---|---|
-| **Vercel** | 公网页面 | ✅ 预打包 + 定时刷新；Blob / R2 缓存远程列表/标题映射 | ✅ 配 `BLOB_READ_WRITE_TOKEN`（Blob）或 `R2_PERSIST_*`（Cloudflare R2）后持久化 |
+| **Vercel** | 公网页面 | ✅ 预打包 + 定时刷新；私有仓库缓存远程列表/标题映射 | ✅ 配 `GITHUB_REPO_TOKEN` + `GITHUB_REPO_NAME` 后持久化 |
 | **Docker** | 完整功能 | ✅ 原版后台线程实时下载 | ✅ 本地文件 / 挂卷永久保存 |
 
 ---
@@ -19,7 +19,7 @@
 | `servers.json` | 远端服务器列表（部署时预取，13 台） |
 | `chinese_db.json` | 游戏标题映射（部署时预取，1 万+ 条） |
 | `env.json.example` | 环境配置模板（复制成 `env.json` 放进仓库根目录） |
-| `api/index.py` | Vercel 适配层（路由前缀还原 + 时区/日志 + /tmp 重定向 + **Vercel Blob / Cloudflare R2 持久化**） |
+| `api/index.py` | Vercel 适配层（路由前缀还原 + 时区/日志 + /tmp 重定向 + **GitHub 私有仓库持久化**） |
 | `vercel.json` | Vercel 路由 / 函数配置 |
 | `.github/workflows/*` | deploy / refresh-servers / docker |
 | `Dockerfile` / `docker-compose.yml` | 完整功能镜像 / 一键启动 |
@@ -74,100 +74,60 @@ https://vercel.com/new/clone?repository-url=https://github.com/jieluojun/lanplay
 | 问题 | 原因 | 解决方案 |
 |---|---|---|
 | 远端服务器列表拉取 | Vercel 不能跑后台线程 | ① 仓库预打包 13 台兜底；② `api/index.py` 冷启动直连拉取最新；③ GitHub Action 每 6h 同步并触发重新部署 |
-| 添加 / 编辑自定义服务器、保存环境变量、远程列表/标题映射缓存 | Vercel 文件系统只读，默认只写 `/tmp`（冷启动清空） | **推荐**：接 Vercel Blob（配 `BLOB_READ_WRITE_TOKEN`）或 Cloudflare R2（配 `R2_PERSIST_*`），适配层内存直连远端存储同步 `env.json` / `servers_manual.json` / `servers.json` / `chinese_db.json`（不写 /tmp）；或改用 Docker 挂卷 |
+| 添加 / 编辑自定义服务器、保存环境变量、远程列表/标题映射缓存 | Vercel 文件系统只读，默认只写 `/tmp`（冷启动清空） | **推荐**：接 GitHub 私有仓库（配 `GITHUB_REPO_TOKEN` + `GITHUB_REPO_NAME`），适配层内存直连仓库同步 `env.json` / `servers_manual.json` / `servers.json` / `chinese_db.json`（不写 /tmp）；或改用 Docker 挂卷 |
 
 > UDP 局域网扫描在 Vercel 上不可用（平台禁用原始 UDP），只能扫公网服务器；
 > 日志长轮询受 60s 函数时长限制。
 
-## Vercel Blob 持久化（配置 + 远程下载缓存）
+## GitHub 私有仓库持久化（配置 + 远程下载缓存）
 
-接上 **Blob** 后，适配层使用 **内存虚拟文件系统（BlobFS）直连 Blob**，**不再写入 `/tmp`**：
+配置 **GitHub 私有仓库** 后，适配层使用 **内存虚拟文件系统（GitFS）直连仓库（Contents API）**，**不再写入 `/tmp`**：
 
-1. **冷启动 hydrate**：从 Blob 拉下列对象进内存（缺失则用部署包兜底）
+1. **冷启动 hydrate**：从私有仓库拉下列文件进内存（确认缺失时用部署包兜底并回填仓库）
    - `lanplay/env.json` — 环境变量配置（含安全密码）
    - `lanplay/servers_manual.json` — 用户自定义服务器
    - `lanplay/servers.json` — 远程公网服务器列表
    - `lanplay/chinese_db.json` — 游戏标题映射
-2. **运行时读写**：`main.py` 仍按「本地文件路径」调用；适配层把路径映射到内存，**读内存 / 写内存并立刻 PUT 到 Blob**
-3. **远程下载**：GitHub 拉取后计算 SHA-256；与当前内存/Blob 内容一致时跳过写入，只有内容变化才更新内存 + Blob（不经 `/tmp`）
-4. **未配置 `BLOB_READ_WRITE_TOKEN`**：退回旧的 `/tmp` 文件模式（不持久）
+2. **运行时读写**：`main.py` 仍按「本地文件路径」调用；适配层把路径映射到内存，**读内存 / 写内存并立刻提交到仓库**（每次写入产生一个 commit，历史可回滚）
+3. **多实例一致性**：读关键接口前按 TTL 从仓库重新拉取（条件请求，内容未变返回 304，不计 API 限额）
+4. **远程下载**：GitHub 拉取后计算 SHA-256；与当前内存/仓库内容一致时跳过写入，只有内容变化才更新内存 + 仓库（不经 `/tmp`）
+5. **未配置 `GITHUB_REPO_TOKEN` + 仓库名**：退回旧的 `/tmp` 文件模式（不持久）
 
-`main.py` / `script.js` **无需修改**。
+`main.py` / `script.js` **无需修改**。与 [sub-store-vercel](https://github.com/jieluojun/sub-store-vercel) 的存储方案一致。
 
 ### 接入步骤
 
-1. 打开 Vercel 项目 → **Storage** → **Create Database / Browse Storage** → 选 **Blob**
-2. Access 建议选 **Private**（`env.json` 含密钥；选 Public 也能跑，适配层会按 `BLOB_ACCESS` 上传）
-3. 创建并 **Connect to Project**（Production / Preview）；Vercel 会自动注入：
-   - `BLOB_READ_WRITE_TOKEN`（必需）
+1. GitHub 新建一个**私有**数据仓库（⚠️ 不要用 Vercel 正在部署的代码仓库，每次保存都会 commit，会触发频繁重新部署），创建时勾选 **Add a README** 保证非空
+2. 创建 Token（二选一）：
+   - [Classic Token](https://github.com/settings/tokens/new)：勾选 **repo** 权限（私有库必须）
+   - Fine-grained Token：只授权该仓库，权限 **Contents: Read and write**
+3. Vercel 项目 → Settings → Environment Variables 添加：
+   - `GITHUB_REPO_TOKEN`（必需）
+   - `GITHUB_REPO_NAME`（必需，纯名称 / `owner/repo` / 完整 URL 均可）
+   - `GITHUB_REPO_USER`（仓库名为纯名称时必需）
 4. 重新部署一次。打开「实时运行日志」，应看到：
-   - `[Blob] 已启用持久化 …`
-   - 首次还没有远端对象时：`pull …：远端不存在`（正常）
-   - 在网页保存一次配置或添加服务器后：`[Blob] PUT 成功 …`
+   - `[GitFS] 内存直连模式 provider=github …`
+   - 在网页保存一次配置或添加服务器后：`[GitFS] PUT 成功 …`，私有仓库出现 `lanplay/` 目录与 commit
 
 ### 相关环境变量
 
 | OS 变量 | 默认 | 说明 |
 |---|---|---|
-| `BLOB_READ_WRITE_TOKEN` | （空） | 有值即启用 Blob 持久化；空则行为与旧版相同（仅 `/tmp`） |
-| `BLOB_ACCESS` | `private` | 必须与 store 创建时一致：`private` / `public`（请求头为 `x-vercel-blob-access`） |
-| `BLOB_STORE_ID` | 从 token 解析 | 一般不用填；token 形如 `vercel_blob_rw_<storeId>_…` 时可自动解析 |
-| `BLOB_PREFIX` | `lanplay/` | 对象路径前缀 |
-| `BLOB_API_VERSION` | `12` | 对齐官方 `@vercel/blob` SDK；一般不用改 |
-| `BLOB_API_URL` | `https://vercel.com/api/blob` | Blob 控制面 API 基址 |
-
-### 注意
-
-- **密钥安全**：优先 Private store；即使 Public，也不要把 blob URL 发到前端。完整配置仍受安全密码门禁保护。
-- **access 必须匹配 store**：Private store 只能 `BLOB_ACCESS=private`（默认）。若日志出现 `Cannot use public access on a private store`，说明旧版用了错误请求头；本版已改为官方 `x-vercel-blob-access`。
-- **并发**：多实例同时保存时 last-write-wins；个人/小流量场景通常可接受。
-- **与聊天媒体存储无关**：这里存的是应用配置 + 远程下载缓存（上述 4 个 JSON）；聊天媒体/头像仍走你在 env.json 里配置的 R2 或腾讯云 COS。数据持久化也可不用 Blob、直接用 R2（见下节）。
-- **体积**：`chinese_db.json` 约 0.5MB 级，Blob 免费额度通常足够；若不想缓存标题映射，可自行在 Blob 控制台删掉 `lanplay/chinese_db.json`（不影响其它文件）。
-- **Docker 部署不受影响**：`BLOB_*` 仅 Vercel 适配层读取；Docker 继续写本地文件/挂卷。
-
-## Cloudflare R2 持久化（可选，与 Blob 二选一）
-
-不想用 Vercel Blob（或已有 Cloudflare 账号）时，可用 **Cloudflare R2** 做同样的数据持久化。
-适配层走 R2 的 **S3 兼容 API + AWS Signature V4**（零第三方依赖），对象布局与 Blob 完全一致：
-
-- `lanplay/env.json` / `lanplay/servers_manual.json` / `lanplay/servers.json` / `lanplay/chinese_db.json`
-- 冷启动 hydrate：R2 → 内存（缺失则用部署包兜底并**回填** R2）；运行时读写与 Blob 模式相同
-- 多实例一致性：读关键接口前按 TTL 从 R2 重新拉取（`PERSIST_REVALIDATE_TTL`，默认 3 秒）
-
-### 接入步骤
-
-1. Cloudflare 控制台 → **R2 Object Storage** → 创建桶（**不要**开启公开访问；`env.json` 含密钥）
-2. **Manage R2 API Tokens** → Create API Token → 权限选 **Object Read & Write**（可限定到该桶）→ 得到 Access Key ID / Secret Access Key
-3. 在 Vercel 项目 → Settings → Environment Variables 添加（账号 ID 在 R2 概览页右侧）：
-   - `R2_PERSIST_ACCOUNT_ID`（回退读 `R2_ACCOUNT_ID`）
-   - `R2_PERSIST_ACCESS_KEY_ID`（回退读 `R2_ACCESS_KEY_ID`）
-   - `R2_PERSIST_SECRET_ACCESS_KEY`（回退读 `R2_SECRET_ACCESS_KEY`）
-   - `R2_PERSIST_BUCKET`（回退读 `R2_BUCKET_NAME`）
-4. 重新部署。实时运行日志应看到 `[R2FS] 内存直连模式 provider=r2 …`；保存配置 / 添加服务器后出现 `[R2FS] PUT 成功 …`
-
-> 已同时配置 Blob 和 R2 时默认用 Blob（兼容旧部署）；要强制 R2 请设置 `PERSIST_PROVIDER=r2`。
-
-### 相关环境变量
-
-| OS 变量 | 默认 | 说明 |
-|---|---|---|
-| `PERSIST_PROVIDER` | `auto` | 持久化后端：`auto`（Blob 优先，其次 R2）/ `blob` / `r2` |
-| `R2_PERSIST_ACCOUNT_ID` | 回退 `R2_ACCOUNT_ID` | Cloudflare Account ID |
-| `R2_PERSIST_ACCESS_KEY_ID` | 回退 `R2_ACCESS_KEY_ID` | R2 API Token 的 Access Key ID |
-| `R2_PERSIST_SECRET_ACCESS_KEY` | 回退 `R2_SECRET_ACCESS_KEY` | R2 API Token 的 Secret |
-| `R2_PERSIST_BUCKET` | 回退 `R2_BUCKET_NAME` | 桶名 |
-| `R2_PERSIST_PREFIX` | `lanplay/` | 对象键前缀（与 Blob 布局一致，可共用同名前缀策略） |
-| `R2_PERSIST_ENDPOINT` | `https://{bucket}.{account}.r2.cloudflarestorage.com` | 端点模板，支持 `{bucket}`/`{account}` 占位符；EU 管辖区桶或自建 S3 兼容服务（path-style，如 `http://host:9000/{bucket}`）时使用 |
-| `R2_PERSIST_REGION` | `auto` | SigV4 签名 region；R2 固定 `auto`，一般不用改 |
+| `GITHUB_REPO_TOKEN` | （空） | Personal Access Token（classic 勾 repo / fine-grained 给 Contents 读写） |
+| `GITHUB_REPO_NAME` | （空） | 数据仓库名称：纯名称 / `owner/repo` / 完整 URL 均可 |
+| `GITHUB_REPO_USER` | （空） | GitHub 用户名；`GITHUB_REPO_NAME` 为纯名称时必需 |
+| `GITHUB_REPO_BRANCH` | 仓库默认分支 | 存储分支 |
+| `GITHUB_REPO_PREFIX` | `lanplay/` | 仓库内存储目录前缀 |
+| `GITHUB_REPO_API` | `https://api.github.com` | API 基址（一般不用改） |
 | `PERSIST_REVALIDATE_TTL` | `3` | 多实例读路径重新拉取远端的 TTL（秒） |
 
 ### 注意
 
-- **与聊天媒体存储相互独立**：聊天头像 / 群文件的 R2（或腾讯云 COS）凭据存在 `env.json` 里由 `main.py` 读取；数据持久化凭据**只**来自 OS 环境变量（`env.json` 本身就存在 R2 里，冷启动必须先有凭据才能读到它）。两者可共用同一套 `R2_*` 变量，也可用 `R2_PERSIST_*` 单独指定。
-- **桶保持私有**：持久化对象含 `env.json`（密码 / GoEasy / R2 密钥），不要开公开访问、不要把对象 URL 发到前端。
-- **费用**：R2 免费额度（每秒 OPS / 每月 A/B 类请求与存储量）对个人监控站点通常足够；`chinese_db.json` 约 0.5MB，回填与日常写入量都很小。
-- **并发**：与 Blob 模式相同，多实例同时保存时 last-write-wins。
-- **Docker 部署不受影响**：`R2_PERSIST_*` 仅 Vercel 适配层读取。
+- **与聊天媒体存储相互独立**：聊天头像 / 群文件的 R2（或腾讯云 COS）凭据存在 `env.json` 里由 `main.py` 读取，功能保留不变；数据持久化凭据**只**来自 OS 环境变量（`env.json` 本身就存在私有仓库里，冷启动必须先有凭据才能读到它，避免鸡生蛋）。
+- **仓库保持私有**：持久化对象含 `env.json`（密码 / GoEasy / R2 密钥），不要公开仓库、不要把 raw URL 发到前端。
+- **速率与额度**：读取走条件请求（304 不计限额），写入才产生 API 调用；Token 每小时 5000 次，日常使用绰绰有余。`chinese_db.json` 约 0.5MB（首次回填一次性提交），单文件上限 100MB。
+- **并发**：多实例同时保存时 last-write-wins；sha 冲突（其它实例先提交）会自动刷新重试一次。
+- **Docker 部署不受影响**：`GITHUB_REPO_*` 仅 Vercel 适配层读取；Docker 继续写本地文件/挂卷。
 
 ## 运行日志（适配器层新增）
 
@@ -236,19 +196,13 @@ Settings → Environment Variables** 里直接配同名变量即可生效，**�
 | — | `DOWNLOAD_TIMEOUT` | float | `300` | 内置下载器单任务超时（秒） |
 | — | `REMOTE_UPDATE_PROXY` | str | `https://v6.gh-proxy.org` | GitHub raw 拉取代理；**Vercel 上推荐设为 `""` 走直连** |
 | — | `SERVERS_FILE` | str | `""` | 覆盖默认「手动服务器列表」JSON 路径；Docker 挂持久卷时常用 |
-| — | `BLOB_READ_WRITE_TOKEN` | str | `""` | **Vercel 专用**：启用 Blob 持久化 |
-| — | `BLOB_ACCESS` | enum | `"private"` | 与 store 一致：`private` / `public` |
-| — | `BLOB_STORE_ID` | str | 自 token 解析 | 可选；private CDN 直读需要 |
-| — | `BLOB_PREFIX` | str | `"lanplay/"` | Blob 对象路径前缀 |
-| — | `BLOB_API_VERSION` | str | `"12"` | 对齐官方 SDK |
-| — | `BLOB_API_URL` | str | `https://vercel.com/api/blob` | 控制面 API 基址 |
-| — | `PERSIST_PROVIDER` | enum | `"auto"` | **Vercel 专用**：持久化后端 `auto` / `blob` / `r2`（auto=Blob 优先） |
-| — | `R2_PERSIST_ACCOUNT_ID` | str | 回退 `R2_ACCOUNT_ID` | R2 持久化：Cloudflare Account ID |
-| — | `R2_PERSIST_ACCESS_KEY_ID` | str | 回退 `R2_ACCESS_KEY_ID` | R2 持久化：Access Key ID |
-| — | `R2_PERSIST_SECRET_ACCESS_KEY` | str | 回退 `R2_SECRET_ACCESS_KEY` | R2 持久化：Secret Access Key |
-| — | `R2_PERSIST_BUCKET` | str | 回退 `R2_BUCKET_NAME` | R2 持久化：桶名 |
-| — | `R2_PERSIST_PREFIX` | str | `"lanplay/"` | R2 持久化：对象键前缀 |
-| — | `R2_PERSIST_ENDPOINT` | str | R2 默认端点 | 端点模板（`{bucket}`/`{account}` 占位；EU 桶 / path-style 自建服务） |
+| — | `GITHUB_REPO_TOKEN` | str | `""` | **Vercel 专用**：启用 GitHub 私有仓库持久化（classic 勾 repo / fine-grained 给 Contents 读写） |
+| — | `GITHUB_REPO_NAME` | str | `""` | 数据仓库名称：纯名称 / `owner/repo` / 完整 URL 均可 |
+| — | `GITHUB_REPO_USER` | str | `""` | GitHub 用户名；仓库名为纯名称时必需 |
+| — | `GITHUB_REPO_BRANCH` | str | `""` | 存储分支（默认仓库默认分支） |
+| — | `GITHUB_REPO_PREFIX` | str | `"lanplay/"` | 仓库内存储目录前缀 |
+| — | `GITHUB_REPO_API` | str | `https://api.github.com` | GitHub API 基址（一般不用改） |
+| — | `PERSIST_REVALIDATE_TTL` | float | `3` | 多实例读路径重新拉取远端的 TTL（秒） |
 
 **密码设置**（三选一，OS 环境变量优先）：
 
@@ -295,10 +249,12 @@ GOEASY_HOST=https://rest-hz.goeasy.io
 # 安全密码（保护环境变量配置页；公网部署强烈建议设置）
 SECURITY_PASSWORD=change-me-to-a-strong-password
 
-# Vercel Blob 持久化（Storage → Blob → Connect 后自动注入 token；也可手动粘贴）
-BLOB_READ_WRITE_TOKEN=vercel_blob_rw_xxxx
-# BLOB_ACCESS=private
-# BLOB_PREFIX=lanplay/
+# GitHub 私有仓库持久化
+GITHUB_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_REPO_NAME=sub-store-data   # 或 owner/repo 形式
+# GITHUB_REPO_USER=your-username  # 仓库名为纯名称时需要
+# GITHUB_REPO_BRANCH=main
+# GITHUB_REPO_PREFIX=lanplay/
 
 # 内存 / 并发
 MAX_WORKERS=8

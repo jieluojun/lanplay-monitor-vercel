@@ -25,18 +25,18 @@
   },
   {
     "id": "4",
-    "name": "中国 江苏 镇江",
-    "host": "yordon.cn",
+    "name": "中国 江苏",
+    "host": "wuaiyi.top",
     "port": 11451,
     "type": "rest",
     "region": "🇨🇳"
   },
   {
     "id": "5",
-    "name": "中国 江苏",
-    "host": "wuaiyi.top",
+    "name": "中国 江苏 ②",
+    "host": "yordon.cn",
     "port": 11451,
-    "type": "rest",
+    "type": "graphql",
     "region": "🇨🇳"
   },
   {

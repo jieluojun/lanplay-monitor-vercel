@@ -2252,189 +2252,28 @@ def int_or_zero(value: Any) -> int:
 HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])$")
 ID_RE = re.compile(r"^[A-Za-z0-9_ -]{1,64}$")
 
-
-# ============================================================================
-# SECTION 7.5 · 游戏标题解析
-# ============================================================================
-
-UNKNOWN_ID = "FFFFFFFFFFFFFFFF"
-SV_COMMUNICATION_ID = "0100A3D008C5C000"
-SV_DISPLAY_NAME = "宝可梦 朱/紫"
-MAX_ADVERTISE_DATA_BYTES = 384
-
-_QUESTION_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
-    '<circle cx="24" cy="24" r="22" fill="#34495e"/>'
-    '<text x="24" y="34" text-anchor="middle" font-size="30" fill="white" '
-    'font-family="sans-serif" font-weight="bold">?</text></svg>'
-)
+_QUESTION_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+                 '<circle cx="24" cy="24" r="22" fill="#34495e"/>'
+                 '<text x="24" y="34" text-anchor="middle" font-size="30" fill="white" '
+                 'font-family="sans-serif" font-weight="bold">?</text></svg>')
 QUESTION_ICON = "data:image/svg+xml," + urllib.parse.quote(_QUESTION_SVG)
-_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-_HEX_SEPARATORS = frozenset(" \t\r\n:-")
+UNKNOWN_ID = "FFFFFFFFFFFFFFFF"
 
 
-def get_room_advertise_data(room: dict[str, Any]) -> Any:
-    """读取 GraphQL 驼峰字段或 UDP/REST 下划线字段。"""
-    return room.get("advertiseData") or room.get("advertise_data") or ""
+def get_game_info(content_id: str, titles_map: dict[str, str]) -> dict[str, Any]:
+    """标题映射解析。
 
+    规则（无映射时不再显示「未知游戏」占位名）：
+    - 命中映射            → 显示映射到的中文/英文标题
+    - 未命中映射          → 直接显示标题 ID（如 0100ABCDEF012000）
+    - 空 ID / FFFF 哨兵值 → 仍显示「未知游戏」+ 问号图标（协议本身就没给标题）
 
-def normalize_advertise_data(value: Any) -> bytes | None:
-    """解码广告数据十六进制串；格式错误或超长数据直接拒绝。"""
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        data = bytes(value)
-        return data if 0 < len(data) <= MAX_ADVERTISE_DATA_BYTES else None
-    if not isinstance(value, str):
-        return None
-
-    text = value.strip()
-    if text[:2].lower() == "0x":
-        text = text[2:]
-    digits: list[str] = []
-    for char in text:
-        if char in _HEX_DIGITS:
-            digits.append(char)
-        elif char not in _HEX_SEPARATORS:
-            return None
-    if not digits or len(digits) % 2 or len(digits) > MAX_ADVERTISE_DATA_BYTES * 2:
-        return None
-    try:
-        return bytes.fromhex("".join(digits))
-    except ValueError:
-        return None
-
-
-def _advertise_bytes_are_zero(data: bytes) -> bool:
-    return not any(data)
-
-
-def _matches_pokemon_sv_game_data(data: bytes) -> bool:
-    """匹配朱/紫广告数据末尾 40 字节中的已知游戏特征。"""
-    game = data[0x5C:]
-    if len(game) != 40:
-        return False
-
-    # Link Trade 搜索：游戏数据全零，或 +0x21..+0x24 的动态字段。
-    if _advertise_bytes_are_zero(game):
-        return True
-    if (
-        _advertise_bytes_are_zero(game[:0x21])
-        and any(game[0x21:0x25])
-        and _advertise_bytes_are_zero(game[0x25:])
-    ):
-        return True
-
-    # Link Code：可打印代码 + little-endian u32 长度；仅接受已知标记。
-    code_length = int.from_bytes(game[0x24:0x28], "little")
-    if not 1 <= code_length <= 16:
-        return False
-    if any(byte < 0x21 or byte > 0x7E for byte in game[:code_length]):
-        return False
-    if not _advertise_bytes_are_zero(game[code_length:0x21]):
-        return False
-
-    marker = game[0x21:0x24]
-    known_markers = {
-        b"\x00\x00\x00",  # Link Trade
-        b"\xaa\x08\x3e",  # 已记录的 Union Circle 标记
-        b"\xaa\x88\xf4",  # 观测到的朱/紫房间标记
-    }
-    return (
-        marker in known_markers
-        and game[0x24] == code_length
-        and _advertise_bytes_are_zero(game[0x25:])
-    )
-
-
-def _is_pokemon_sv_advertise_data(data: bytes) -> bool:
-    """严格验证 132 字节 Pia 头和朱/紫专属数据布局。"""
-    if len(data) != 132 or data[:5] != bytes.fromhex("005c150015"):
-        return False
-    if (
-        data[0x15] != 1
-        or not 1 <= data[0x16] <= 4
-        or data[0x17:0x1B] != b"\x00\x00\x00\x01"
-        or data[0x1B] != 1
-        or data[0x1C] != 0x20
-        or not _advertise_bytes_are_zero(data[0x1D:0x5C])
-    ):
-        return False
-    return _matches_pokemon_sv_game_data(data)
-
-
-def resolve_advertised_title_id(
-    advertise_data: Any, host_player_name: str | None = None
-) -> str | None:
-    """只用房间自己的 advertiseData 解析已知 all-F 游戏特征。"""
-    data = normalize_advertise_data(advertise_data)
-    if data is None:
-        return None
-    hex_data = data.hex()
-
-    # DRAGON BALL FighterZ。
-    if hex_data == "ffff0000":
-        return "0100A250097F0000"
-
-    # Rocket League 广告数据是 JSON 对象。
-    if len(data) >= 2 and data[0] == ord("{") and data[-1] == ord("}"):
-        return "01005EE0036EC000"
-
-    # 朱/紫在网络通信中共用 Scarlet 的 ID。
-    if _is_pokemon_sv_advertise_data(data):
-        return SV_COMMUNICATION_ID
-
-    delimiter = "00000004"
-    delimiter_count = hex_data.count(delimiter)
-    delimiter_index = hex_data.find(delimiter)
-    first_part = hex_data[:delimiter_index] if delimiter_index >= 0 else hex_data
-
-    # MONSTER HUNTER RISE。
-    if (
-        delimiter_count >= 2
-        and "0000000008100000" in first_part
-        and "8b9000" in first_part
-    ):
-        return "0100B04011742000"
-
-    # Monster Hunter Stories 2。
-    if "0000000008100000" in first_part and "0a0000" in first_part:
-        return "0100E21011446000"
-
-    # Minecraft：广告数据偏移 16 处开始包含房主 UTF-8 名称。
-    if host_player_name and len(data) > 16:
-        raw_name = data[16:].split(b"\x00", 1)[0]
-        if 0 < len(raw_name) <= 95:
-            try:
-                decoded_name = raw_name.decode("utf-8")
-            except UnicodeDecodeError:
-                decoded_name = ""
-            if decoded_name == host_player_name:
-                return "0100D71004694000"
-
-    return None
-
-
-def get_game_info(
-    content_id: str,
-    titles_map: dict[str, str],
-    advertise_data: Any = None,
-    host_player_name: str | None = None,
-) -> dict[str, Any]:
-    """按标题 ID 映射；all-F 哨兵值再尝试识别房间广告特征。"""
+    图标：未映射的 ID 也先按 ID 去图库拉真实图标，前端 onerror 时再回退问号图标。
+    """
     normalized = str(content_id or "").upper()
-
-    if normalized == UNKNOWN_ID:
-        resolved_id = resolve_advertised_title_id(advertise_data, host_player_name)
-        if resolved_id:
-            # 朱/紫共享通信 ID，避免错误地区分朱版与紫版。
-            if resolved_id == SV_COMMUNICATION_ID:
-                return {
-                    "name": SV_DISPLAY_NAME,
-                    "icon": f"https://api.nlib.cc/nx/{SV_COMMUNICATION_ID}/icon/128/128",
-                    "unmapped": False,
-                }
-            normalized = resolved_id
-
     mapped = titles_map.get(normalized)
+
+    # 只有真正无 ID 可显示的情况才叫「未知游戏」
     is_placeholder = (not normalized) or normalized == UNKNOWN_ID
     is_unmapped = False
 
@@ -2442,6 +2281,7 @@ def get_game_info(
         game_name = "未知游戏"
     elif mapped:
         game_name = mapped
+        # 兼容历史映射表里写死的 "未知游戏 (xxx)" 之类占位名 → 退回纯 ID
         if game_name.startswith("未知游戏") or game_name.strip() == "":
             game_name = normalized
             is_unmapped = True
@@ -2453,13 +2293,13 @@ def get_game_info(
         icon = QUESTION_ICON
     else:
         icon = f"https://api.nlib.cc/nx/{normalized}/icon/128/128"
+        # 备用图库 icon = f"https://tinfoil.media/ti/{normalized}/128/128"
 
     return {
         "name": game_name,
         "icon": icon,
         "unmapped": is_unmapped,
     }
-
 
 # ============================================================================
 # SECTION 8 · HTTP 客户端
@@ -3096,9 +2936,7 @@ def normalize_room(raw: Any, server: dict[str, Any], index: int,
                   titles_map: dict[str, str]) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     content_id = str(raw.get("contentId") or raw.get("content_id") or "").upper()
-    advertise_data = get_room_advertise_data(raw)
-    host = str(raw.get("hostPlayerName") or raw.get("host_player_name") or "").strip()
-    g_info = get_game_info(content_id, titles_map, advertise_data, host)
+    g_info = get_game_info(content_id, titles_map)
     nodes = raw.get("nodes") if isinstance(raw.get("nodes"), list) else []
     players: list[str] = []
     for node in nodes:
@@ -3109,6 +2947,7 @@ def normalize_room(raw: Any, server: dict[str, Any], index: int,
         if not name:
             name = "未命名玩家"
         players.append(name)
+    host = str(raw.get("hostPlayerName") or raw.get("host_player_name") or "").strip()
     if not host:
         host = players[0] if players else "未知玩家"
     elif not players:

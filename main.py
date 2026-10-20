@@ -2333,14 +2333,17 @@ def _matches_pokemon_sv_game_data(data: bytes) -> bool:
         return False
 
     marker = game[0x21:0x24]
-    known_markers = {
-        b"\x00\x00\x00",  # Link Trade
-        b"\xaa\x08\x3e",  # 已记录的 Union Circle 标记
-        b"\xaa\x88\xf4",  # 观测到的朱/紫房间标记
-        b"\xaa\xe8\x8c",  # 重建房间实测标记
+    no_mode_marker = marker == b"\x00\x00\x00"
+    # Live S/V link-code rooms have used AA 88 F4, AA E8 8C and AA 88 72.
+    # The final byte varies between rebuilt rooms; accept only the observed
+    # AA 08 / AA 88 / AA E8 mode prefixes after all other strict checks pass.
+    observed_marker_prefix = marker[:2] in {
+        b"\xaa\x08",
+        b"\xaa\x88",
+        b"\xaa\xe8",
     }
     return (
-        marker in known_markers
+        (no_mode_marker or observed_marker_prefix)
         and game[0x24] == code_length
         and _advertise_bytes_are_zero(game[0x25:])
     )
